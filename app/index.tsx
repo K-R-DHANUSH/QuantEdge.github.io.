@@ -1,13 +1,10 @@
 /**
- * index.tsx — Main Home Screen v3.0
+ * index.tsx — Main Home Screen v3.1
+ * Place at: app/index.tsx  (replaces your existing one)
  *
- * New in v3.0:
- *  - Settings, Trade Log, Active Position tabs in bottom nav
- *  - TradeActionModal: smart qty/price recommendation on BUY signal
- *  - "I Bought It" / "Leave It" buttons on BestStockCard
- *  - ActivePositionBanner: live P&L, sell alert, mark as sold
- *  - Skipped symbols filtered from "best pick" so next best is shown
- *  - Background parallel tracking: active position monitored while next best runs
+ * Changes from v3.0:
+ *  - Replaced useColorScheme() with useTheme() from ThemeContext
+ *  - Added <ThemeToggleButton> in the header (top-right, next to BUY pill)
  */
 
 import React, { useEffect, useState, useRef, useCallback, useMemo } from "react";
@@ -16,14 +13,14 @@ import {
   RefreshControl, StyleSheet, TouchableOpacity,
   StatusBar, Platform, Animated,
 } from "react-native";
-import { useColorScheme } from "react-native";
+import { useTheme }                from "../app/_layout";
 import { fetchSignals, StockSignal } from "../services/api";
-import { lightTheme, darkTheme } from "../constants/theme";
 import StockCard             from "../components/StockCard";
 import BestStockCard         from "../components/BestStockCard";
 import MarketSummaryBar      from "../components/Marketsummarybar";
 import ActivePositionBanner  from "../components/ActivePositionBanner";
 import TradeActionModal      from "../components/TradeActionModal";
+import ThemeToggleButton     from "../components/ThemeToggleButton";
 import SettingsScreen        from "./settings";
 import TradeLogScreen        from "./tradelog";
 import {
@@ -45,7 +42,8 @@ type TabType    = "HOME" | "LOG" | "SETTINGS";
 const POLL_INTERVAL = 60_000;
 
 export default function Home() {
-  // ── App state ─────────────────────────────────────────────────────────────
+  const { theme, isDark } = useTheme();   // ← replaces useColorScheme()
+
   const [activeTab,    setActiveTab]    = useState<TabType>("HOME");
   const [signals,      setSignals]      = useState<StockSignal[]>([]);
   const [loading,      setLoading]      = useState(true);
@@ -59,19 +57,13 @@ export default function Home() {
   const [bestSymbol,   setBestSymbol]   = useState<string | null>(null);
   const [countdown,    setCountdown]    = useState(POLL_INTERVAL / 1000);
 
-  // ── Goals & Position state ────────────────────────────────────────────────
-  const [goals,          setGoals]         = useState<UserGoals | null>(null);
-  const [activePosition, setActivePosition]= useState<ActivePosition | null>(null);
-  const [skippedSymbols, setSkippedSymbols]= useState<Set<string>>(new Set());
-  const [showTradeModal, setShowTradeModal]= useState(false);
-  const [modalStock,     setModalStock]    = useState<StockSignal | null>(null);
-  const [todayPL,        setTodayPL]       = useState(0);
+  const [goals,          setGoals]          = useState<UserGoals | null>(null);
+  const [activePosition, setActivePosition] = useState<ActivePosition | null>(null);
+  const [skippedSymbols, setSkippedSymbols] = useState<Set<string>>(new Set());
+  const [showTradeModal, setShowTradeModal] = useState(false);
+  const [modalStock,     setModalStock]     = useState<StockSignal | null>(null);
+  const [todayPL,        setTodayPL]        = useState(0);
 
-  // ── Theme ─────────────────────────────────────────────────────────────────
-  const scheme = useColorScheme();
-  const theme  = scheme === "dark" ? darkTheme : lightTheme;
-
-  // ── Refs ──────────────────────────────────────────────────────────────────
   const notifiedSignals    = useRef<Record<string, string>>({});
   const notifiedConfluence = useRef<Record<string, boolean>>({});
   const wasMarketOpen      = useRef(false);
@@ -88,7 +80,6 @@ export default function Home() {
     return () => anim.stop();
   }, []);
 
-  // ── Load Goals & Active Position on startup ────────────────────────────────
   useEffect(() => {
     const init = async () => {
       const [g, pos, log] = await Promise.all([
@@ -96,20 +87,15 @@ export default function Home() {
       ]);
       setGoals(g);
       setActivePosition(pos);
-      const summary = getTodaySummary(log, g);
-      setTodayPL(summary.totalPL);
+      setTodayPL(getTodaySummary(log, g).totalPL);
     };
     init();
   }, []);
 
-  // Refresh goals when settings tab is closed
   useEffect(() => {
-    if (activeTab !== "SETTINGS") {
-      loadGoals().then(setGoals);
-    }
+    if (activeTab !== "SETTINGS") loadGoals().then(setGoals);
   }, [activeTab]);
 
-  // Refresh today PL when log tab is closed
   useEffect(() => {
     if (activeTab !== "LOG") {
       loadTradeLog().then(log => {
@@ -118,7 +104,6 @@ export default function Home() {
     }
   }, [activeTab]);
 
-  // ── Load Data ─────────────────────────────────────────────────────────────
   const loadData = useCallback(async (force = false) => {
     try {
       setError(null);
@@ -170,9 +155,7 @@ export default function Home() {
       }
 
       setSignals(response.signals);
-      setLastUpdated(
-        new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })
-      );
+      setLastUpdated(new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" }));
       setCountdown(POLL_INTERVAL / 1000);
     } catch {
       setError("Connection failed. Retrying…");
@@ -195,40 +178,24 @@ export default function Home() {
     return () => clearInterval(tick);
   }, [lastUpdated]);
 
-  // ── Derived / memoized ────────────────────────────────────────────────────
-  const filtered = useMemo(() =>
-    filter === "ALL" ? signals : signals.filter(s => s.signal === filter),
-    [signals, filter]
-  );
+  const filtered   = useMemo(() => filter === "ALL" ? signals : signals.filter(s => s.signal === filter), [signals, filter]);
+  const buyCount   = useMemo(() => signals.filter(s => s.signal === "BUY").length,  [signals]);
+  const sellCount  = useMemo(() => signals.filter(s => s.signal === "SELL").length, [signals]);
+  const holdCount  = useMemo(() => signals.filter(s => s.signal === "HOLD").length, [signals]);
 
-  const buyCount  = useMemo(() => signals.filter(s => s.signal === "BUY").length,  [signals]);
-  const sellCount = useMemo(() => signals.filter(s => s.signal === "SELL").length, [signals]);
-  const holdCount = useMemo(() => signals.filter(s => s.signal === "HOLD").length, [signals]);
-
-  // Best stock to recommend — skip active position symbol AND user-skipped symbols
   const bestBuy = useMemo(() => {
     const activeSymbol = activePosition?.symbol;
     return (
-      signals.find(s =>
-        s.signal === "BUY" &&
-        s.symbol === bestSymbol &&
-        s.symbol !== activeSymbol &&
-        !skippedSymbols.has(s.symbol)
-      ) ||
-      signals.find(s =>
-        s.signal === "BUY" &&
-        s.symbol !== activeSymbol &&
-        !skippedSymbols.has(s.symbol)
-      ) ||
+      signals.find(s => s.signal === "BUY" && s.symbol === bestSymbol && s.symbol !== activeSymbol && !skippedSymbols.has(s.symbol)) ||
+      signals.find(s => s.signal === "BUY" && s.symbol !== activeSymbol && !skippedSymbols.has(s.symbol)) ||
       null
     );
   }, [signals, bestSymbol, activePosition, skippedSymbols]);
 
-  // Current price & signal for the active position symbol
-  const activeSignalData = useMemo(() => {
-    if (!activePosition) return null;
-    return signals.find(s => s.symbol === activePosition.symbol) ?? null;
-  }, [signals, activePosition]);
+  const activeSignalData = useMemo(() =>
+    activePosition ? signals.find(s => s.symbol === activePosition.symbol) ?? null : null,
+    [signals, activePosition]
+  );
 
   const buyRankMap = useMemo(() => {
     const map: Record<string, number> = {};
@@ -236,34 +203,15 @@ export default function Home() {
     return map;
   }, [signals]);
 
-  const onRefresh = useCallback(() => { setRefreshing(true); loadData(true); }, [loadData]);
-
-  // ── Trade action handlers ─────────────────────────────────────────────────
-  const handleBuyPress = useCallback((stock: StockSignal) => {
-    setModalStock(stock);
-    setShowTradeModal(true);
-  }, []);
-
-  const handleBought = useCallback((position: ActivePosition) => {
-    setActivePosition(position);
-    setShowTradeModal(false);
-  }, []);
-
-  const handleSkip = useCallback((symbol: string) => {
-    setSkippedSymbols(prev => new Set([...prev, symbol]));
-    setShowTradeModal(false);
-  }, []);
-
-  const handleSold = useCallback((pl: number) => {
+  const onRefresh        = useCallback(() => { setRefreshing(true); loadData(true); }, [loadData]);
+  const handleBuyPress   = useCallback((stock: StockSignal) => { setModalStock(stock); setShowTradeModal(true); }, []);
+  const handleBought     = useCallback((position: ActivePosition) => { setActivePosition(position); setShowTradeModal(false); }, []);
+  const handleSkip       = useCallback((symbol: string) => { setSkippedSymbols(prev => new Set([...prev, symbol])); setShowTradeModal(false); }, []);
+  const handleSold       = useCallback((pl: number) => {
     setActivePosition(null);
-    setTodayPL(prev => prev + pl);
-    // Reload log
-    loadTradeLog().then(log => {
-      if (goals) setTodayPL(getTodaySummary(log, goals).totalPL);
-    });
+    loadTradeLog().then(log => { if (goals) setTodayPL(getTodaySummary(log, goals).totalPL); });
   }, [goals]);
 
-  // ── Loading screen ────────────────────────────────────────────────────────
   if (loading) {
     return (
       <View style={[styles.centered, { backgroundColor: theme.background }]}>
@@ -275,7 +223,6 @@ export default function Home() {
     );
   }
 
-  // ── Tab: Settings ─────────────────────────────────────────────────────────
   if (activeTab === "SETTINGS") {
     return (
       <View style={{ flex: 1 }}>
@@ -285,7 +232,6 @@ export default function Home() {
     );
   }
 
-  // ── Tab: Trade Log ────────────────────────────────────────────────────────
   if (activeTab === "LOG") {
     return (
       <View style={{ flex: 1 }}>
@@ -295,11 +241,10 @@ export default function Home() {
     );
   }
 
-  // ── Tab: Home ─────────────────────────────────────────────────────────────
   return (
     <View style={[styles.container, { backgroundColor: theme.background }]}>
       <StatusBar
-        barStyle={scheme === "dark" ? "light-content" : "dark-content"}
+        barStyle={isDark ? "light-content" : "dark-content"}
         backgroundColor={theme.surface}
       />
 
@@ -316,11 +261,8 @@ export default function Home() {
         </View>
 
         <View style={styles.headerRight}>
-          {/* Today P&L badge */}
           {goals && (
-            <View style={[styles.pill, {
-              backgroundColor: todayPL >= 0 ? theme.buy + "22" : theme.sell + "22",
-            }]}>
+            <View style={[styles.pill, { backgroundColor: todayPL >= 0 ? theme.buy + "22" : theme.sell + "22" }]}>
               <Text style={[styles.pillText, { color: todayPL >= 0 ? theme.buy : theme.sell }]}>
                 {todayPL >= 0 ? "+" : ""}₹{Math.abs(todayPL).toLocaleString("en-IN", { maximumFractionDigits: 0 })}
               </Text>
@@ -335,10 +277,11 @@ export default function Home() {
               <Text style={[styles.pillText, { color: theme.textSecondary }]}>🔴 Closed</Text>
             </View>
           )}
+          {/* ── Day/Night Toggle ── */}
+          <ThemeToggleButton size="sm" />
         </View>
       </View>
 
-      {/* ── Market Closed Banner ────────────────────────────────────────── */}
       {!marketOpen && (
         <View style={[styles.closedBanner, { backgroundColor: theme.surface, borderColor: theme.border }]}>
           <Text style={[styles.closedTitle, { color: theme.text }]}>🕐 Market is Closed</Text>
@@ -349,7 +292,6 @@ export default function Home() {
         </View>
       )}
 
-      {/* ── Error Banner ────────────────────────────────────────────────── */}
       {error && (
         <View style={[styles.errorBanner, { backgroundColor: theme.sell + "18" }]}>
           <Text style={{ color: theme.sell, fontSize: 13 }}>⚠️ {error}</Text>
@@ -359,12 +301,10 @@ export default function Home() {
         </View>
       )}
 
-      {/* ── Market Summary Bar ───────────────────────────────────────────── */}
       {marketOpen && signals.length > 0 && (
         <MarketSummaryBar signals={signals} theme={theme} openPos={openPos} />
       )}
 
-      {/* ── Filter Tabs ─────────────────────────────────────────────────── */}
       {marketOpen && signals.length > 0 && (
         <View style={[styles.tabRow, { borderBottomColor: theme.border }]}>
           {(["ALL", "BUY", "SELL", "HOLD"] as FilterType[]).map(f => {
@@ -383,7 +323,6 @@ export default function Home() {
         </View>
       )}
 
-      {/* ── Main List ───────────────────────────────────────────────────── */}
       <FlatList
         data={filtered}
         keyExtractor={item => item.symbol}
@@ -394,7 +333,6 @@ export default function Home() {
         }
         ListHeaderComponent={
           <>
-            {/* Active Position Banner — runs parallel to best buy pick */}
             {activePosition && (
               <ActivePositionBanner
                 position={activePosition}
@@ -404,20 +342,15 @@ export default function Home() {
                 onSold={handleSold}
               />
             )}
-
-            {/* Best Buy Pick (skips active position symbol + user-skipped) */}
             {bestBuy && marketOpen && filter === "ALL" && (
               <View>
                 <BestStockCard item={bestBuy} theme={theme} />
-                {/* Buy / Skip action buttons */}
                 <View style={styles.actionBtnRow}>
                   <TouchableOpacity
                     onPress={() => handleSkip(bestBuy.symbol)}
                     style={[styles.leaveBtn, { borderColor: theme.border }]}
                   >
-                    <Text style={[styles.leaveBtnText, { color: theme.textSecondary }]}>
-                      ✗  Leave It
-                    </Text>
+                    <Text style={[styles.leaveBtnText, { color: theme.textSecondary }]}>✗  Leave It</Text>
                   </TouchableOpacity>
                   <TouchableOpacity
                     onPress={() => handleBuyPress(bestBuy)}
@@ -454,10 +387,8 @@ export default function Home() {
         }
       />
 
-      {/* ── Bottom Navigation ─────────────────────────────────────────────── */}
       <BottomNav activeTab={activeTab} setActiveTab={setActiveTab} theme={theme} />
 
-      {/* ── Trade Action Modal ────────────────────────────────────────────── */}
       {goals && (
         <TradeActionModal
           visible={showTradeModal}
@@ -475,45 +406,30 @@ export default function Home() {
   );
 }
 
-// ── Bottom Nav Component ───────────────────────────────────────────────────
-
 function BottomNav({ activeTab, setActiveTab, theme }: {
   activeTab: TabType;
   setActiveTab: (t: TabType) => void;
   theme: any;
 }) {
   return (
-    <View style={[styles.bottomNav, {
-      backgroundColor: theme.surface,
-      borderTopColor: theme.border,
-    }]}>
+    <View style={[styles.bottomNav, { backgroundColor: theme.surface, borderTopColor: theme.border }]}>
       {([
-        { key: "HOME",     icon: "📈", label: "Signals"  },
+        { key: "HOME",     icon: "📈", label: "Signals"   },
         { key: "LOG",      icon: "📋", label: "Trade Log" },
         { key: "SETTINGS", icon: "⚙️", label: "Settings"  },
       ] as { key: TabType; icon: string; label: string }[]).map(tab => (
-        <TouchableOpacity
-          key={tab.key}
-          onPress={() => setActiveTab(tab.key)}
-          style={styles.navItem}
-        >
+        <TouchableOpacity key={tab.key} onPress={() => setActiveTab(tab.key)} style={styles.navItem}>
           <Text style={styles.navIcon}>{tab.icon}</Text>
-          <Text style={[
-            styles.navLabel,
-            { color: activeTab === tab.key ? theme.accent : theme.textSecondary },
-          ]}>
+          <Text style={[styles.navLabel, { color: activeTab === tab.key ? theme.accent : theme.textSecondary }]}>
             {tab.label}
           </Text>
-          {activeTab === tab.key && (
-            <View style={[styles.navActiveDot, { backgroundColor: theme.accent }]} />
-          )}
+          {activeTab === tab.key && <View style={[styles.navActiveDot, { backgroundColor: theme.accent }]} />}
         </TouchableOpacity>
       ))}
     </View>
   );
 }
 
-// ── Styles ─────────────────────────────────────────────────────────────────
 const styles = StyleSheet.create({
   container:   { flex: 1 },
   centered:    { flex: 1, justifyContent: "center", alignItems: "center" },
@@ -529,16 +445,13 @@ const styles = StyleSheet.create({
   headerSubRow: { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 3 },
   liveDot:      { width: 6, height: 6, borderRadius: 3 },
   headerSub:    { fontSize: 11 },
-  headerRight:  { flexDirection: "row", gap: 6 },
+  headerRight:  { flexDirection: "row", gap: 6, alignItems: "center" },
   pill:         { paddingHorizontal: 9, paddingVertical: 4, borderRadius: 20 },
   pillText:     { fontSize: 11, fontWeight: "600" },
 
-  closedBanner: {
-    margin: 12, padding: 16, borderRadius: 12,
-    borderWidth: 1, alignItems: "center",
-  },
-  closedTitle: { fontSize: 17, fontWeight: "600", marginBottom: 4 },
-  closedSub:   { fontSize: 13, textAlign: "center" },
+  closedBanner: { margin: 12, padding: 16, borderRadius: 12, borderWidth: 1, alignItems: "center" },
+  closedTitle:  { fontSize: 17, fontWeight: "600", marginBottom: 4 },
+  closedSub:    { fontSize: 13, textAlign: "center" },
 
   errorBanner: {
     marginHorizontal: 12, marginBottom: 4, padding: 10, borderRadius: 8,
@@ -550,19 +463,10 @@ const styles = StyleSheet.create({
   tab:     { flex: 1, alignItems: "center", paddingVertical: 10 },
   tabText: { fontSize: 12, fontWeight: "600" },
 
-  actionBtnRow: {
-    flexDirection: "row", gap: 10,
-    marginTop: -6, marginBottom: 14,
-    paddingHorizontal: 2,
-  },
-  leaveBtn: {
-    flex: 0.4, alignItems: "center", paddingVertical: 13,
-    borderRadius: 12, borderWidth: 1,
-  },
+  actionBtnRow: { flexDirection: "row", gap: 10, marginTop: -6, marginBottom: 14, paddingHorizontal: 2 },
+  leaveBtn:     { flex: 0.4, alignItems: "center", paddingVertical: 13, borderRadius: 12, borderWidth: 1 },
   leaveBtnText: { fontSize: 14, fontWeight: "700" },
-  considerBtn: {
-    flex: 1, alignItems: "center", paddingVertical: 13, borderRadius: 12,
-  },
+  considerBtn:  { flex: 1, alignItems: "center", paddingVertical: 13, borderRadius: 12 },
   considerBtnText: { color: "#fff", fontSize: 15, fontWeight: "800" },
 
   empty:     { alignItems: "center", paddingTop: 60 },
@@ -574,12 +478,8 @@ const styles = StyleSheet.create({
     paddingBottom: Platform.OS === "ios" ? 28 : 8,
     paddingTop: 8, position: "absolute", bottom: 0, left: 0, right: 0,
   },
-  navItem: {
-    flex: 1, alignItems: "center", paddingVertical: 4, position: "relative",
-  },
-  navIcon:  { fontSize: 22 },
-  navLabel: { fontSize: 10, fontWeight: "600", marginTop: 2 },
-  navActiveDot: {
-    width: 4, height: 4, borderRadius: 2, marginTop: 3,
-  },
+  navItem:     { flex: 1, alignItems: "center", paddingVertical: 4 },
+  navIcon:     { fontSize: 22 },
+  navLabel:    { fontSize: 10, fontWeight: "600", marginTop: 2 },
+  navActiveDot:{ width: 4, height: 4, borderRadius: 2, marginTop: 3 },
 });
