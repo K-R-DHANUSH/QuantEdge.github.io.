@@ -1,53 +1,68 @@
 /**
- * Below are the colors that are used in the app. The colors are defined in the light and dark mode.
- * There are many other ways to style your app. For example, [Nativewind](https://www.nativewind.dev/), [Tamagui](https://tamagui.dev/), [unistyles](https://reactnativeunistyles.vercel.app), etc.
+ * theme.ts — Color System
+ *
+ * WHAT THIS FILE DOES:
+ *  - Defines two complete color themes: light and dark
+ *  - Every component uses these instead of hardcoded colors
+ *  - This way changing the theme changes the WHOLE app at once
+ *
+ * HOW TO USE:
+ *  import { lightTheme, darkTheme } from "../constants/theme";
+ *  const theme = useColorScheme() === "dark" ? darkTheme : lightTheme;
+ *  <View style={{ backgroundColor: theme.background }}>
  */
 
-import { Platform } from 'react-native';
+// ── Type Definition ───────────────────────────────────────────────────────────
+// This ensures both themes have exactly the same keys (no typos)
+export interface Theme {
+  background:   string;   // Main screen background
+  card:         string;   // Stock card background
+  surface:      string;   // Secondary surfaces (modals, headers)
+  text:         string;   // Primary text
+  textSecondary:string;   // Muted/secondary text
+  border:       string;   // Subtle borders
+  buy:          string;   // Green — BUY signal
+  sell:         string;   // Red — SELL signal
+  hold:         string;   // Amber — HOLD signal
+  bestCard:     string;   // Background for the "Best Opportunity" card
+  accent:       string;   // Brand accent color (used in charts, headers)
+  shadow:       string;   // Shadow color (iOS) / elevation (Android)
+  positive:     string;   // Profit indicator
+  negative:     string;   // Loss indicator
+}
 
-const tintColorLight = '#0a7ea4';
-const tintColorDark = '#fff';
-
-export const Colors = {
-  light: {
-    text: '#11181C',
-    background: '#fff',
-    tint: tintColorLight,
-    icon: '#687076',
-    tabIconDefault: '#687076',
-    tabIconSelected: tintColorLight,
-  },
-  dark: {
-    text: '#ECEDEE',
-    background: '#151718',
-    tint: tintColorDark,
-    icon: '#9BA1A6',
-    tabIconDefault: '#9BA1A6',
-    tabIconSelected: tintColorDark,
-  },
+// ── Light Theme ───────────────────────────────────────────────────────────────
+export const lightTheme: Theme = {
+  background:    "#F5F7FA",   // Very light grey — easier on eyes than pure white
+  card:          "#FFFFFF",   // White cards on grey background
+  surface:       "#EEF1F7",   // Slightly darker surface for headers
+  text:          "#0D1117",   // Near-black for readability
+  textSecondary: "#6B7280",   // Grey for secondary info
+  border:        "#E2E8F0",   // Light border
+  buy:           "#00C853",   // Bright green (NSE green vibes)
+  sell:          "#FF3D3D",   // Clear red
+  hold:          "#FF9800",   // Amber
+  bestCard:      "#003D1F",   // Deep green for best card header
+  accent:        "#1A56DB",   // Indigo accent
+  shadow:        "#000000",   // Black shadow
+  positive:      "#00C853",
+  negative:      "#FF3D3D",
 };
 
-export const Fonts = Platform.select({
-  ios: {
-    /** iOS `UIFontDescriptorSystemDesignDefault` */
-    sans: 'system-ui',
-    /** iOS `UIFontDescriptorSystemDesignSerif` */
-    serif: 'ui-serif',
-    /** iOS `UIFontDescriptorSystemDesignRounded` */
-    rounded: 'ui-rounded',
-    /** iOS `UIFontDescriptorSystemDesignMonospaced` */
-    mono: 'ui-monospace',
-  },
-  default: {
-    sans: 'normal',
-    serif: 'serif',
-    rounded: 'normal',
-    mono: 'monospace',
-  },
-  web: {
-    sans: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
-    serif: "Georgia, 'Times New Roman', serif",
-    rounded: "'SF Pro Rounded', 'Hiragino Maru Gothic ProN', Meiryo, 'MS PGothic', sans-serif",
-    mono: "SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
-  },
-});
+// ── Dark Theme ────────────────────────────────────────────────────────────────
+export const darkTheme: Theme = {
+  background:    "#0D1117",   // Deep dark — like a trading terminal
+  card:          "#161B22",   // Slightly lighter than background
+  surface:       "#21262D",   // Header / modal surface
+  text:          "#E6EDF3",   // Off-white (pure white can cause eye strain)
+  textSecondary: "#8B949E",   // Muted grey
+  border:        "#30363D",   // Subtle dark border
+  buy:           "#3FB950",   // Softer green (works better on dark)
+  sell:          "#F85149",   // Softer red
+  hold:          "#D29922",   // Softer amber
+  bestCard:      "#003D1F",   // Same deep green (looks great on dark)
+  accent:        "#388BFD",   // Lighter blue for dark bg
+  shadow:        "#000000",
+  positive:      "#3FB950",
+  negative:      "#F85149",
+};
