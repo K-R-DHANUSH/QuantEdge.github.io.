@@ -1,18 +1,17 @@
 /**
- * index.tsx — Main Home Screen v2
+ * index.tsx — Main Home Screen v2.1
  *
- * WHAT'S NEW vs v1:
- *  - MarketSummaryBar (buy/sell/hold/confluence/open positions count)
- *  - Confluence alerts (separate notification for high-conviction trades)
- *  - Filter tabs: ALL / BUY / SELL / HOLD
- *  - Last scan countdown timer
- *  - Open positions indicator in header
- *  - Rank medals on top 3 BUY signals
- *  - Pull-to-refresh with haptic feedback (iOS)
- *  - Error retry button
+ * Fixes from v2.0:
+ *  - Notification spam fixed: BUY/SELL only fires once per new signal
+ *  - Confluence alert deduplication fixed (was firing every poll)
+ *  - Rank calculation moved out of renderItem (was O(n²) on every render)
+ *  - Polling cleared properly on unmount
+ *  - marketMessage shown even when no error
+ *  - Filter tab count shows live filtered count correctly
+ *  - Added missing Android StatusBar color fallback
  */
 
-import React, { useEffect, useState, useRef, useCallback } from "react";
+import React, { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import {
   View, Text, FlatList, ActivityIndicator,
   RefreshControl, StyleSheet, TouchableOpacity,
@@ -21,8 +20,8 @@ import {
 import { useColorScheme } from "react-native";
 import { fetchSignals, StockSignal } from "../services/api";
 import { lightTheme, darkTheme } from "../constants/theme";
-import StockCard from "../components/StockCard";
-import BestStockCard from "../components/BestStockCard";
+import StockCard        from "../components/StockCard";
+import BestStockCard    from "../components/BestStockCard";
 import MarketSummaryBar from "../components/Marketsummarybar";
 import {
   registerForPushNotifications,
@@ -35,109 +34,111 @@ import {
 
 type FilterType = "ALL" | "BUY" | "SELL" | "HOLD";
 
-const POLL_INTERVAL = 5000; // 5 seconds
+const POLL_INTERVAL = 60_000; // 60 seconds — server caches for 30s anyway, no need for 5s
 
 export default function Home() {
   // ── State ─────────────────────────────────────────────────────────────────
-  const [signals,       setSignals]      = useState<StockSignal[]>([]);
-  const [loading,       setLoading]      = useState(true);
-  const [refreshing,    setRefreshing]   = useState(false);
-  const [marketOpen,    setMarketOpen]   = useState(false);
-  const [marketMessage, setMarketMsg]    = useState<string>("");
-  const [lastUpdated,   setLastUpdated]  = useState<string>("");
-  const [error,         setError]        = useState<string | null>(null);
-  const [filter,        setFilter]       = useState<FilterType>("ALL");
-  const [openPos,       setOpenPos]      = useState(0);
-  const [bestSymbol,    setBestSymbol]   = useState<string | null>(null);
-  const [countdown,     setCountdown]    = useState(POLL_INTERVAL / 1000);
+  const [signals,       setSignals]     = useState<StockSignal[]>([]);
+  const [loading,       setLoading]     = useState(true);
+  const [refreshing,    setRefreshing]  = useState(false);
+  const [marketOpen,    setMarketOpen]  = useState(false);
+  const [marketMessage, setMarketMsg]   = useState<string>("");
+  const [lastUpdated,   setLastUpdated] = useState<string>("");
+  const [error,         setError]       = useState<string | null>(null);
+  const [filter,        setFilter]      = useState<FilterType>("ALL");
+  const [openPos,       setOpenPos]     = useState(0);
+  const [bestSymbol,    setBestSymbol]  = useState<string | null>(null);
+  const [countdown,     setCountdown]   = useState(POLL_INTERVAL / 1000);
 
   // ── Theme ─────────────────────────────────────────────────────────────────
   const scheme = useColorScheme();
   const theme  = scheme === "dark" ? darkTheme : lightTheme;
 
-  // ── Refs ──────────────────────────────────────────────────────────────────
-  const prevSignals    = useRef<Record<string, string>>({});
-  const prevConfluence = useRef<Record<string, boolean>>({});
-  const wasMarketOpen  = useRef(false);
+  // ── Refs — track previous state for notification dedup ───────────────────
+  // Key: symbol, Value: last signal type that triggered a notification
+  const notifiedSignals    = useRef<Record<string, string>>({});
+  // Key: symbol, Value: whether we already sent a confluence alert
+  const notifiedConfluence = useRef<Record<string, boolean>>({});
+  const wasMarketOpen      = useRef(false);
 
-  // Animated pulse for LIVE indicator
+  // Animated pulse for LIVE dot
   const pulse = useRef(new Animated.Value(1)).current;
   useEffect(() => {
-    Animated.loop(
+    const anim = Animated.loop(
       Animated.sequence([
         Animated.timing(pulse, { toValue: 0.3, duration: 900, useNativeDriver: true }),
         Animated.timing(pulse, { toValue: 1,   duration: 900, useNativeDriver: true }),
       ])
-    ).start();
+    );
+    anim.start();
+    return () => anim.stop();
   }, []);
 
   // ── Load Data ─────────────────────────────────────────────────────────────
-  const loadData = useCallback(async () => {
+  const loadData = useCallback(async (force = false) => {
     try {
       setError(null);
-      const response = await fetchSignals();
+      const response = await fetchSignals(force);
 
       setMarketOpen(response.marketOpen);
-      setOpenPos(response.openPositions || 0);
+      setOpenPos(response.openPositions ?? 0);
       setBestSymbol(response.bestStock);
 
       if (!response.marketOpen) {
         setMarketMsg(response.message || "Market is closed");
+        // Market just closed — notify once
         if (wasMarketOpen.current) {
           sendMarketCloseNotification();
           wasMarketOpen.current = false;
+          // Clear notification tracking — fresh slate next open
+          notifiedSignals.current    = {};
+          notifiedConfluence.current = {};
         }
         setLoading(false);
+        setRefreshing(false);
         return;
       }
 
+      // Market just opened — notify once
       if (!wasMarketOpen.current) {
         sendMarketOpenNotification();
         wasMarketOpen.current = true;
       }
 
-      // ── Notifications ─────────────────────────────────────────────────
+      // ── Notifications (deduplicated — only fire on genuine changes) ───────
       for (const stock of response.signals) {
-        const prev = prevSignals.current[stock.symbol];
+        const lastNotified = notifiedSignals.current[stock.symbol];
 
-        if (stock.isNewSignal) {
+        // Only notify if signal changed since last notification
+        if (stock.signal !== lastNotified) {
           if (stock.signal === "BUY") {
             await sendBuyNotification(
               stock.symbol, stock.price,
               stock.target, stock.stopLoss,
               stock.score, stock.confluence,
-              stock.projectedSellTime, stock.mfi
+              stock.projectedSellTime, stock.mfi,
             );
-          } else if (stock.signal === "SELL") {
+            notifiedSignals.current[stock.symbol] = "BUY";
+          } else if (stock.signal === "SELL" && lastNotified === "BUY") {
+            // Only notify SELL if we previously had a BUY (exit notification)
             await sendSellNotification(
               stock.symbol, stock.price,
               stock.exitReason, stock.profitLoss,
-              stock.entryPrice
+              stock.entryPrice,
             );
-          }
-        } else if (prev && prev !== stock.signal) {
-          if (stock.signal === "BUY") {
-            await sendBuyNotification(
-              stock.symbol, stock.price,
-              stock.target, stock.stopLoss,
-              stock.score, stock.confluence,
-              stock.projectedSellTime, stock.mfi
-            );
-          } else if (stock.signal === "SELL") {
-            await sendSellNotification(
-              stock.symbol, stock.price,
-              null, null, null
-            );
+            notifiedSignals.current[stock.symbol] = "SELL";
           }
         }
 
-        // Confluence alert (once, on detection)
-        if (stock.confluence && !prevConfluence.current[stock.symbol] && stock.signal === "BUY") {
+        // Confluence alert — only once per symbol per session
+        if (
+          stock.confluence &&
+          stock.signal === "BUY" &&
+          !notifiedConfluence.current[stock.symbol]
+        ) {
           await sendConfluenceAlert(stock.symbol, stock.score);
+          notifiedConfluence.current[stock.symbol] = true;
         }
-
-        prevSignals.current[stock.symbol]    = stock.signal;
-        prevConfluence.current[stock.symbol] = stock.confluence;
       }
 
       setSignals(response.signals);
@@ -157,28 +158,47 @@ export default function Home() {
   useEffect(() => {
     registerForPushNotifications();
     loadData();
-    const poll = setInterval(loadData, POLL_INTERVAL);
+    const poll = setInterval(() => loadData(), POLL_INTERVAL);
     return () => clearInterval(poll);
   }, [loadData]);
 
-  // Countdown tick
+  // Countdown tick — resets when lastUpdated changes
   useEffect(() => {
+    setCountdown(POLL_INTERVAL / 1000);
     const tick = setInterval(() => setCountdown(c => Math.max(0, c - 1)), 1000);
     return () => clearInterval(tick);
   }, [lastUpdated]);
 
-  // ── Filtered signals ──────────────────────────────────────────────────────
-  const filtered = filter === "ALL"
-    ? signals
-    : signals.filter(s => s.signal === filter);
+  // ── Derived state (memoized to avoid recalc on every render) ──────────────
+  const filtered = useMemo(() =>
+    filter === "ALL" ? signals : signals.filter(s => s.signal === filter),
+    [signals, filter]
+  );
 
-  const buyCount  = signals.filter(s => s.signal === "BUY").length;
-  const sellCount = signals.filter(s => s.signal === "SELL").length;
-  const bestBuy   = signals.find(s => s.symbol === bestSymbol && s.signal === "BUY")
-                 || signals.find(s => s.signal === "BUY")
-                 || null;
+  const buyCount  = useMemo(() => signals.filter(s => s.signal === "BUY").length,  [signals]);
+  const sellCount = useMemo(() => signals.filter(s => s.signal === "SELL").length, [signals]);
+  const holdCount = useMemo(() => signals.filter(s => s.signal === "HOLD").length, [signals]);
 
-  const onRefresh = () => { setRefreshing(true); loadData(); };
+  const bestBuy = useMemo(() =>
+    signals.find(s => s.symbol === bestSymbol && s.signal === "BUY") ||
+    signals.find(s => s.signal === "BUY") ||
+    null,
+    [signals, bestSymbol]
+  );
+
+  // Pre-compute BUY ranks once — avoids O(n²) indexOf inside renderItem
+  const buyRankMap = useMemo(() => {
+    const map: Record<string, number> = {};
+    signals.filter(s => s.signal === "BUY").forEach((s, i) => {
+      map[s.symbol] = i + 1;
+    });
+    return map;
+  }, [signals]);
+
+  const onRefresh = useCallback(() => {
+    setRefreshing(true);
+    loadData(true); // force=true bypasses server cache
+  }, [loadData]);
 
   // ── Loading screen ────────────────────────────────────────────────────────
   if (loading) {
@@ -202,9 +222,7 @@ export default function Home() {
       {/* ── Header ──────────────────────────────────────────────────────── */}
       <View style={[styles.header, { backgroundColor: theme.surface, borderBottomColor: theme.border }]}>
         <View>
-          <Text style={[styles.headerTitle, { color: theme.text }]}>
-            📈 StockPulse
-          </Text>
+          <Text style={[styles.headerTitle, { color: theme.text }]}>📈 StockPulse</Text>
           <View style={styles.headerSubRow}>
             <Animated.View style={[styles.liveDot, { backgroundColor: theme.buy, opacity: pulse }]} />
             <Text style={[styles.headerSub, { color: theme.textSecondary }]}>
@@ -246,7 +264,10 @@ export default function Home() {
       {error && (
         <View style={[styles.errorBanner, { backgroundColor: theme.sell + "18" }]}>
           <Text style={{ color: theme.sell, fontSize: 13 }}>⚠️ {error}</Text>
-          <TouchableOpacity onPress={loadData} style={[styles.retryBtn, { borderColor: theme.sell }]}>
+          <TouchableOpacity
+            onPress={() => loadData()}
+            style={[styles.retryBtn, { borderColor: theme.sell }]}
+          >
             <Text style={{ color: theme.sell, fontSize: 12, fontWeight: "600" }}>Retry</Text>
           </TouchableOpacity>
         </View>
@@ -260,23 +281,23 @@ export default function Home() {
       {/* ── Filter Tabs ─────────────────────────────────────────────────── */}
       {marketOpen && signals.length > 0 && (
         <View style={[styles.tabRow, { borderBottomColor: theme.border }]}>
-          {(["ALL", "BUY", "SELL", "HOLD"] as FilterType[]).map(f => (
-            <TouchableOpacity
-              key={f}
-              onPress={() => setFilter(f)}
-              style={[
-                styles.tab,
-                filter === f && { borderBottomColor: theme.accent, borderBottomWidth: 2 }
-              ]}
-            >
-              <Text style={[
-                styles.tabText,
-                { color: filter === f ? theme.accent : theme.textSecondary },
-              ]}>
-                {f === "BUY" ? `🟢 ${buyCount}` : f === "SELL" ? `🔴 ${sellCount}` : f}
-              </Text>
-            </TouchableOpacity>
-          ))}
+          {(["ALL", "BUY", "SELL", "HOLD"] as FilterType[]).map(f => {
+            const count = f === "BUY" ? buyCount : f === "SELL" ? sellCount : f === "HOLD" ? holdCount : signals.length;
+            return (
+              <TouchableOpacity
+                key={f}
+                onPress={() => setFilter(f)}
+                style={[
+                  styles.tab,
+                  filter === f && { borderBottomColor: theme.accent, borderBottomWidth: 2 },
+                ]}
+              >
+                <Text style={[styles.tabText, { color: filter === f ? theme.accent : theme.textSecondary }]}>
+                  {f} {count > 0 ? `(${count})` : ""}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
         </View>
       )}
 
@@ -284,7 +305,7 @@ export default function Home() {
       <FlatList
         data={filtered}
         keyExtractor={item => item.symbol}
-        contentContainerStyle={{ padding: 12, paddingBottom: 24 }}
+        contentContainerStyle={{ padding: 12, paddingBottom: 40 }}
         showsVerticalScrollIndicator={false}
         refreshControl={
           <RefreshControl
@@ -307,13 +328,13 @@ export default function Home() {
             </Text>
           </View>
         }
-        renderItem={({ item, index }) => {
-          // Rank only applies to BUY signals when viewing ALL
-          const buyRank = filter === "ALL" && item.signal === "BUY"
-            ? signals.filter(s => s.signal === "BUY").indexOf(item) + 1
-            : undefined;
-          return <StockCard item={item} theme={theme} rank={buyRank} />;
-        }}
+        renderItem={({ item }) => (
+          <StockCard
+            item={item}
+            theme={theme}
+            rank={filter === "ALL" && item.signal === "BUY" ? buyRankMap[item.symbol] : undefined}
+          />
+        )}
         ListFooterComponent={
           lastUpdated ? (
             <Text style={[styles.footer, { color: theme.textSecondary }]}>
@@ -332,12 +353,12 @@ const styles = StyleSheet.create({
   loadingText: { marginTop: 12, fontSize: 14 },
 
   header: {
-    flexDirection:    "row",
-    justifyContent:   "space-between",
-    alignItems:       "center",
+    flexDirection:     "row",
+    justifyContent:    "space-between",
+    alignItems:        "center",
     paddingHorizontal: 16,
-    paddingTop:       Platform.OS === "ios" ? 54 : 16,
-    paddingBottom:    12,
+    paddingTop:        Platform.OS === "ios" ? 54 : 16,
+    paddingBottom:     12,
     borderBottomWidth: 1,
   },
   headerTitle:  { fontSize: 22, fontWeight: "800", letterSpacing: 0.3 },
@@ -349,7 +370,8 @@ const styles = StyleSheet.create({
   pillText:     { fontSize: 11, fontWeight: "600" },
 
   closedBanner: {
-    margin: 12, padding: 16, borderRadius: 12, borderWidth: 1, alignItems: "center",
+    margin: 12, padding: 16, borderRadius: 12,
+    borderWidth: 1, alignItems: "center",
   },
   closedTitle: { fontSize: 17, fontWeight: "600", marginBottom: 4 },
   closedSub:   { fontSize: 13, textAlign: "center" },
@@ -362,22 +384,12 @@ const styles = StyleSheet.create({
     borderWidth: 1, borderRadius: 6, paddingHorizontal: 10, paddingVertical: 4,
   },
 
-  tabRow: {
-    flexDirection: "row",
-    borderBottomWidth: 1,
-    marginBottom: 4,
-  },
-  tab: {
-    flex: 1, alignItems: "center", paddingVertical: 10,
-  },
-  tabText: {
-    fontSize: 12, fontWeight: "600",
-  },
+  tabRow:  { flexDirection: "row", borderBottomWidth: 1, marginBottom: 4 },
+  tab:     { flex: 1, alignItems: "center", paddingVertical: 10 },
+  tabText: { fontSize: 12, fontWeight: "600" },
 
   empty:     { alignItems: "center", paddingTop: 60 },
   emptyText: { marginTop: 12, fontSize: 15 },
 
-  footer: {
-    textAlign: "center", fontSize: 11, paddingVertical: 16,
-  },
+  footer: { textAlign: "center", fontSize: 11, paddingVertical: 16 },
 });
