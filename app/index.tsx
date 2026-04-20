@@ -1,10 +1,14 @@
 /**
- * index.tsx — Main Home Screen v3.1
- * Place at: app/index.tsx  (replaces your existing one)
+ * index.tsx — Main Home Screen v3.2
  *
- * Changes from v3.0:
- *  - Replaced useColorScheme() with useTheme() from ThemeContext
- *  - Added <ThemeToggleButton> in the header (top-right, next to BUY pill)
+ * Changes from v3.1:
+ *  - Filter tabs now include "WEAK BUY" alongside BUY, SELL, HOLD
+ *  - buyCount includes both BUY + WEAK BUY
+ *  - Header pill shows total buy-side signals (BUY + WEAK BUY)
+ *  - Added recommendQty() — calculates suggested share quantity
+ *    based on user's capital goal, risk %, ATR stop-loss distance
+ *  - BestStockCard and StockCard now receive recommended qty
+ *  - Notification logic updated to fire for WEAK BUY too
  */
 
 import React, { useEffect, useState, useRef, useCallback, useMemo } from "react";
@@ -36,13 +40,54 @@ import {
   UserGoals, ActivePosition,
 } from "../services/storage";
 
-type FilterType = "ALL" | "BUY" | "SELL" | "HOLD";
+// ── Filter type now includes WEAK BUY ─────────────────────────────────────────
+type FilterType = "ALL" | "BUY" | "WEAK BUY" | "SELL" | "HOLD";
 type TabType    = "HOME" | "LOG" | "SETTINGS";
 
 const POLL_INTERVAL = 60_000;
 
+// ── Quantity Recommendation Engine ───────────────────────────────────────────
+/**
+ * Recommends how many shares to buy based on:
+ *  - capital:    user's available capital (from goals)
+ *  - riskPct:    max % of capital to risk per trade (default 1%)
+ *  - price:      current stock price
+ *  - stopLoss:   server-computed stop-loss (price - 1.5×ATR)
+ *
+ * Formula: qty = floor( (capital × riskPct) / (price - stopLoss) )
+ * Capped so total cost doesn't exceed 25% of capital (position sizing).
+ *
+ * Returns null if data is insufficient.
+ */
+function recommendQty(
+  capital: number | null | undefined,
+  price: number,
+  stopLoss: number | null | undefined,
+  riskPct = 0.01,   // 1% risk per trade
+): { qty: number; riskAmount: number; totalCost: number; riskPerShare: number } | null {
+  if (!capital || capital <= 0 || !stopLoss || stopLoss <= 0) return null;
+  const riskPerShare = price - stopLoss;
+  if (riskPerShare <= 0) return null;
+
+  const riskBudget = capital * riskPct;          // e.g. ₹5,000 if capital=5L, risk=1%
+  let qty = Math.floor(riskBudget / riskPerShare);
+  if (qty < 1) qty = 1;
+
+  // Cap: don't put more than 25% of capital in one trade
+  const maxQtyByCap = Math.floor((capital * 0.25) / price);
+  qty = Math.min(qty, maxQtyByCap);
+  if (qty < 1) return null;
+
+  return {
+    qty,
+    riskAmount: +(qty * riskPerShare).toFixed(2),
+    totalCost:  +(qty * price).toFixed(2),
+    riskPerShare: +riskPerShare.toFixed(2),
+  };
+}
+
 export default function Home() {
-  const { theme, isDark } = useTheme();   // ← replaces useColorScheme()
+  const { theme, isDark } = useTheme();
 
   const [activeTab,    setActiveTab]    = useState<TabType>("HOME");
   const [signals,      setSignals]      = useState<StockSignal[]>([]);
@@ -133,14 +178,16 @@ export default function Home() {
 
       for (const stock of response.signals) {
         const lastNotified = notifiedSignals.current[stock.symbol];
+        const isBuySide = stock.signal === "BUY" || stock.signal === "WEAK BUY";
+
         if (stock.signal !== lastNotified) {
-          if (stock.signal === "BUY") {
+          if (isBuySide && lastNotified !== "BUY" && lastNotified !== "WEAK BUY") {
             await sendBuyNotification(
               stock.symbol, stock.price, stock.target, stock.stopLoss,
               stock.score, stock.confluence, stock.projectedSellTime, stock.mfi,
             );
-            notifiedSignals.current[stock.symbol] = "BUY";
-          } else if (stock.signal === "SELL" && lastNotified === "BUY") {
+            notifiedSignals.current[stock.symbol] = stock.signal;
+          } else if (stock.signal === "SELL" && (lastNotified === "BUY" || lastNotified === "WEAK BUY")) {
             await sendSellNotification(
               stock.symbol, stock.price,
               stock.exitReason, stock.profitLoss, stock.entryPrice,
@@ -148,7 +195,7 @@ export default function Home() {
             notifiedSignals.current[stock.symbol] = "SELL";
           }
         }
-        if (stock.confluence && stock.signal === "BUY" && !notifiedConfluence.current[stock.symbol]) {
+        if (stock.confluence && isBuySide && !notifiedConfluence.current[stock.symbol]) {
           await sendConfluenceAlert(stock.symbol, stock.score);
           notifiedConfluence.current[stock.symbol] = true;
         }
@@ -178,16 +225,27 @@ export default function Home() {
     return () => clearInterval(tick);
   }, [lastUpdated]);
 
-  const filtered   = useMemo(() => filter === "ALL" ? signals : signals.filter(s => s.signal === filter), [signals, filter]);
-  const buyCount   = useMemo(() => signals.filter(s => s.signal === "BUY").length,  [signals]);
-  const sellCount  = useMemo(() => signals.filter(s => s.signal === "SELL").length, [signals]);
-  const holdCount  = useMemo(() => signals.filter(s => s.signal === "HOLD").length, [signals]);
+  // ── Counts ──────────────────────────────────────────────────────────────────
+  const buyCount      = useMemo(() => signals.filter(s => s.signal === "BUY").length,       [signals]);
+  const weakBuyCount  = useMemo(() => signals.filter(s => s.signal === "WEAK BUY").length,  [signals]);
+  const sellCount     = useMemo(() => signals.filter(s => s.signal === "SELL").length,      [signals]);
+  const holdCount     = useMemo(() => signals.filter(s => s.signal === "HOLD").length,      [signals]);
+  const totalBuySide  = buyCount + weakBuyCount;
 
+  // ── Filtered list ───────────────────────────────────────────────────────────
+  const filtered = useMemo(() => {
+    if (filter === "ALL") return signals;
+    return signals.filter(s => s.signal === filter);
+  }, [signals, filter]);
+
+  // ── Best buy candidate ──────────────────────────────────────────────────────
   const bestBuy = useMemo(() => {
     const activeSymbol = activePosition?.symbol;
     return (
       signals.find(s => s.signal === "BUY" && s.symbol === bestSymbol && s.symbol !== activeSymbol && !skippedSymbols.has(s.symbol)) ||
       signals.find(s => s.signal === "BUY" && s.symbol !== activeSymbol && !skippedSymbols.has(s.symbol)) ||
+      signals.find(s => s.signal === "WEAK BUY" && s.confluence && s.symbol !== activeSymbol && !skippedSymbols.has(s.symbol)) ||
+      signals.find(s => s.signal === "WEAK BUY" && s.symbol !== activeSymbol && !skippedSymbols.has(s.symbol)) ||
       null
     );
   }, [signals, bestSymbol, activePosition, skippedSymbols]);
@@ -199,15 +257,22 @@ export default function Home() {
 
   const buyRankMap = useMemo(() => {
     const map: Record<string, number> = {};
-    signals.filter(s => s.signal === "BUY").forEach((s, i) => { map[s.symbol] = i + 1; });
+    signals.filter(s => s.signal === "BUY" || s.signal === "WEAK BUY")
+      .forEach((s, i) => { map[s.symbol] = i + 1; });
     return map;
   }, [signals]);
+
+  // ── Qty recommendation for best buy ─────────────────────────────────────────
+  const bestBuyQty = useMemo(() => {
+    if (!bestBuy) return null;
+    return recommendQty(goals?.capitalPerTrade ?? goals?.dailyTarget, bestBuy.price, bestBuy.stopLoss);
+  }, [bestBuy, goals]);
 
   const onRefresh        = useCallback(() => { setRefreshing(true); loadData(true); }, [loadData]);
   const handleBuyPress   = useCallback((stock: StockSignal) => { setModalStock(stock); setShowTradeModal(true); }, []);
   const handleBought     = useCallback((position: ActivePosition) => { setActivePosition(position); setShowTradeModal(false); }, []);
   const handleSkip       = useCallback((symbol: string) => { setSkippedSymbols(prev => new Set([...prev, symbol])); setShowTradeModal(false); }, []);
-  const handleSold       = useCallback((pl: number) => {
+  const handleSold       = useCallback((_pl: number) => {
     setActivePosition(null);
     loadTradeLog().then(log => { if (goals) setTodayPL(getTodaySummary(log, goals).totalPL); });
   }, [goals]);
@@ -217,7 +282,7 @@ export default function Home() {
       <View style={[styles.centered, { backgroundColor: theme.background }]}>
         <ActivityIndicator size="large" color={theme.buy} />
         <Text style={[styles.loadingText, { color: theme.textSecondary }]}>
-          Scanning 20 stocks · 12 indicators…
+          Scanning 500+ stocks · 12 indicators…
         </Text>
       </View>
     );
@@ -248,7 +313,7 @@ export default function Home() {
         backgroundColor={theme.surface}
       />
 
-      {/* ── Header ──────────────────────────────────────────────────────── */}
+      {/* ── Header ────────────────────────────────────────────────────────── */}
       <View style={[styles.header, { backgroundColor: theme.surface, borderBottomColor: theme.border }]}>
         <View>
           <Text style={[styles.headerTitle, { color: theme.text }]}>📈 StockPulse</Text>
@@ -270,14 +335,15 @@ export default function Home() {
           )}
           {marketOpen ? (
             <View style={[styles.pill, { backgroundColor: theme.buy + "22" }]}>
-              <Text style={[styles.pillText, { color: theme.buy }]}>🟢 {buyCount} BUY</Text>
+              <Text style={[styles.pillText, { color: theme.buy }]}>
+                🟢 {totalBuySide} BUY
+              </Text>
             </View>
           ) : (
             <View style={[styles.pill, { backgroundColor: theme.border }]}>
               <Text style={[styles.pillText, { color: theme.textSecondary }]}>🔴 Closed</Text>
             </View>
           )}
-          {/* ── Day/Night Toggle ── */}
           <ThemeToggleButton size="sm" />
         </View>
       </View>
@@ -305,21 +371,29 @@ export default function Home() {
         <MarketSummaryBar signals={signals} theme={theme} openPos={openPos} />
       )}
 
+      {/* ── Filter Tabs (now includes WEAK BUY) ─────────────────────────── */}
       {marketOpen && signals.length > 0 && (
         <View style={[styles.tabRow, { borderBottomColor: theme.border }]}>
-          {(["ALL", "BUY", "SELL", "HOLD"] as FilterType[]).map(f => {
-            const count = f === "BUY" ? buyCount : f === "SELL" ? sellCount : f === "HOLD" ? holdCount : signals.length;
-            return (
-              <TouchableOpacity
-                key={f} onPress={() => setFilter(f)}
-                style={[styles.tab, filter === f && { borderBottomColor: theme.accent, borderBottomWidth: 2 }]}
-              >
-                <Text style={[styles.tabText, { color: filter === f ? theme.accent : theme.textSecondary }]}>
-                  {f} {count > 0 ? `(${count})` : ""}
-                </Text>
-              </TouchableOpacity>
-            );
-          })}
+          {([
+            { key: "ALL",      label: "ALL",       count: signals.length },
+            { key: "BUY",      label: "BUY",       count: buyCount      },
+            { key: "WEAK BUY", label: "⚡ WEAK",   count: weakBuyCount  },
+            { key: "SELL",     label: "SELL",      count: sellCount     },
+            { key: "HOLD",     label: "HOLD",      count: holdCount     },
+          ] as { key: FilterType; label: string; count: number }[]).map(f => (
+            <TouchableOpacity
+              key={f.key}
+              onPress={() => setFilter(f.key)}
+              style={[
+                styles.tab,
+                filter === f.key && { borderBottomColor: theme.accent, borderBottomWidth: 2 },
+              ]}
+            >
+              <Text style={[styles.tabText, { color: filter === f.key ? theme.accent : theme.textSecondary }]}>
+                {f.label}{f.count > 0 ? ` (${f.count})` : ""}
+              </Text>
+            </TouchableOpacity>
+          ))}
         </View>
       )}
 
@@ -344,7 +418,32 @@ export default function Home() {
             )}
             {bestBuy && marketOpen && filter === "ALL" && (
               <View>
-                <BestStockCard item={bestBuy} theme={theme} />
+                <BestStockCard item={bestBuy} theme={theme} recommendedQty={bestBuyQty} />
+
+                {/* ── Qty recommendation strip ───────────────────────── */}
+                {bestBuyQty && (
+                  <View style={[styles.qtyStrip, { backgroundColor: theme.buy + "12", borderColor: theme.buy + "40" }]}>
+                    <View style={styles.qtyItem}>
+                      <Text style={[styles.qtyLabel, { color: theme.textSecondary }]}>Suggested Qty</Text>
+                      <Text style={[styles.qtyValue, { color: theme.buy }]}>{bestBuyQty.qty} shares</Text>
+                    </View>
+                    <View style={styles.qtySep} />
+                    <View style={styles.qtyItem}>
+                      <Text style={[styles.qtyLabel, { color: theme.textSecondary }]}>Total Cost</Text>
+                      <Text style={[styles.qtyValue, { color: theme.text }]}>
+                        ₹{bestBuyQty.totalCost.toLocaleString("en-IN")}
+                      </Text>
+                    </View>
+                    <View style={styles.qtySep} />
+                    <View style={styles.qtyItem}>
+                      <Text style={[styles.qtyLabel, { color: theme.textSecondary }]}>Max Risk</Text>
+                      <Text style={[styles.qtyValue, { color: theme.sell }]}>
+                        ₹{bestBuyQty.riskAmount.toLocaleString("en-IN")}
+                      </Text>
+                    </View>
+                  </View>
+                )}
+
                 <View style={styles.actionBtnRow}>
                   <TouchableOpacity
                     onPress={() => handleSkip(bestBuy.symbol)}
@@ -356,7 +455,9 @@ export default function Home() {
                     onPress={() => handleBuyPress(bestBuy)}
                     style={[styles.considerBtn, { backgroundColor: theme.buy }]}
                   >
-                    <Text style={styles.considerBtnText}>💰  I Want to Buy</Text>
+                    <Text style={styles.considerBtnText}>
+                      💰  Buy {bestBuyQty ? `${bestBuyQty.qty} shares` : "Now"}
+                    </Text>
                   </TouchableOpacity>
                 </View>
               </View>
@@ -367,17 +468,29 @@ export default function Home() {
           <View style={styles.empty}>
             <Text style={{ fontSize: 40 }}>📊</Text>
             <Text style={[styles.emptyText, { color: theme.textSecondary }]}>
-              {marketOpen ? "Waiting for signals…" : "Market is closed"}
+              {marketOpen
+                ? filter !== "ALL"
+                  ? `No ${filter} signals right now`
+                  : "Waiting for signals…"
+                : "Market is closed"}
             </Text>
           </View>
         }
-        renderItem={({ item }) => (
-          <StockCard
-            item={item}
-            theme={theme}
-            rank={filter === "ALL" && item.signal === "BUY" ? buyRankMap[item.symbol] : undefined}
-          />
-        )}
+        renderItem={({ item }) => {
+          const qty = recommendQty(
+            goals?.capitalPerTrade ?? goals?.dailyTarget,
+            item.price,
+            item.stopLoss,
+          );
+          return (
+            <StockCard
+              item={item}
+              theme={theme}
+              rank={filter === "ALL" && (item.signal === "BUY" || item.signal === "WEAK BUY") ? buyRankMap[item.symbol] : undefined}
+              recommendedQty={qty}
+            />
+          );
+        }}
         ListFooterComponent={
           lastUpdated ? (
             <Text style={[styles.footer, { color: theme.textSecondary }]}>
@@ -406,6 +519,7 @@ export default function Home() {
   );
 }
 
+// ── Bottom Nav ────────────────────────────────────────────────────────────────
 function BottomNav({ activeTab, setActiveTab, theme }: {
   activeTab: TabType;
   setActiveTab: (t: TabType) => void;
@@ -430,6 +544,7 @@ function BottomNav({ activeTab, setActiveTab, theme }: {
   );
 }
 
+// ── Styles ────────────────────────────────────────────────────────────────────
 const styles = StyleSheet.create({
   container:   { flex: 1 },
   centered:    { flex: 1, justifyContent: "center", alignItems: "center" },
@@ -461,9 +576,19 @@ const styles = StyleSheet.create({
 
   tabRow:  { flexDirection: "row", borderBottomWidth: 1, marginBottom: 4 },
   tab:     { flex: 1, alignItems: "center", paddingVertical: 10 },
-  tabText: { fontSize: 12, fontWeight: "600" },
+  tabText: { fontSize: 11, fontWeight: "600" },
 
-  actionBtnRow: { flexDirection: "row", gap: 10, marginTop: -6, marginBottom: 14, paddingHorizontal: 2 },
+  // ── Qty strip ──────────────────────────────────────────────────────────────
+  qtyStrip: {
+    flexDirection: "row", borderRadius: 10, borderWidth: 1,
+    marginBottom: 10, paddingVertical: 10, paddingHorizontal: 8,
+  },
+  qtyItem:  { flex: 1, alignItems: "center" },
+  qtyLabel: { fontSize: 10, marginBottom: 3 },
+  qtyValue: { fontSize: 14, fontWeight: "800" },
+  qtySep:   { width: 1, backgroundColor: "#00000018", marginVertical: 2 },
+
+  actionBtnRow: { flexDirection: "row", gap: 10, marginTop: 0, marginBottom: 14, paddingHorizontal: 2 },
   leaveBtn:     { flex: 0.4, alignItems: "center", paddingVertical: 13, borderRadius: 12, borderWidth: 1 },
   leaveBtnText: { fontSize: 14, fontWeight: "700" },
   considerBtn:  { flex: 1, alignItems: "center", paddingVertical: 13, borderRadius: 12 },
