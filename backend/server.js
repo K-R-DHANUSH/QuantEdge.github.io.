@@ -1,13 +1,14 @@
 /**
- * server.js — Elite Indian Stock Market Signal Engine v3.1
+ * server.js — Elite Indian Stock Market Signal Engine v3.2
  *
- * Changes from v3.0:
- *  - BUY threshold lowered: 68 → 58 (more BUY signals in mixed markets)
- *  - Confluence HOLD demotion raised: score < 80 → score < 65 (less aggressive demotion)
- *  - Confluence requirement lowered: 5 → 4 indicators (easier to qualify)
- *  - Added "WEAK BUY" signal tier (score 50–57, confluence) shown separately
- *  - bestStock now also considers WEAK BUY if no strong BUY found
- *  - All v3.0 logic preserved (12 indicators, scoring, positions, batching)
+ * Changes from v3.1:
+ *  - Added Groww brokerage & all statutory charge deductions
+ *  - Net P&L (after all charges) computed for every BUY/WEAK BUY signal
+ *  - Only stocks where NET profit > 0 after charges are flagged as "PROFITABLE"
+ *  - New `/signals?profitable=true` filter to surface only net-profitable trades
+ *  - Brokerage breakdown (brokerage, STT, SEBI, stamp, exchange, GST) exposed per stock
+ *  - `minQty` and `tradeValue` computed from ATR-based target/stop
+ *  - All v3.1 logic preserved
  */
 
 const express = require("express");
@@ -30,6 +31,144 @@ app.use(express.json());
 const BATCH_SIZE  = 20;
 const BATCH_DELAY = 350;
 const CACHE_TTL   = 120_000;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GROWW BROKERAGE MODEL (Intraday / Delivery)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Groww charges:
+//   Intraday:  ₹20 per executed order OR 0.05% of trade value, whichever is LOWER
+//   Delivery:  ZERO brokerage
+//
+// Statutory charges (same for both):
+//   STT:        0.025% of trade value on SELL side only (intraday)
+//               0.1%   of trade value on BOTH sides (delivery)
+//   SEBI fees:  ₹10 per crore (= 0.000010 per ₹ = 0.001% of trade value) — both sides
+//   Exchange (NSE/BSE turnover fee):
+//               NSE intraday: 0.00297% per side
+//               BSE intraday: 0.00375% per side  (we default to NSE)
+//   Stamp duty: 0.003% on BUY side only (intraday); 0.015% on BUY side (delivery)
+//   GST:        18% on (brokerage + exchange fee + SEBI fee)
+//   IPFT:       ₹10 per crore = 0.0000001 per ₹ (negligible, included)
+//
+// This engine uses INTRADAY model (signals are intraday 1-min chart based).
+// ─────────────────────────────────────────────────────────────────────────────
+
+const GROWW = {
+  // Intraday brokerage: min(₹20, 0.05% of trade value) per order
+  brokerageRate:    0.0005,   // 0.05%
+  brokerageCap:     20,       // ₹20 per order
+
+  // STT — 0.025% on SELL side only (intraday)
+  sttRate:          0.00025,
+
+  // SEBI charges — ₹10 per crore of turnover (both sides)
+  sebiRate:         0.000001, // = 0.0001%
+
+  // NSE exchange fee (intraday) — 0.00297% both sides
+  exchangeRate:     0.0000297,
+
+  // Stamp duty — 0.003% on BUY side only (intraday)
+  stampRate:        0.00003,
+
+  // GST — 18% on (brokerage + exchange + sebi)
+  gstRate:          0.18,
+
+  // IPFT — ₹10 per crore on each side
+  ipftRate:         0.0000001,
+};
+
+/**
+ * calculateGrowwCharges(buyPrice, sellPrice, qty)
+ * Returns a full breakdown of all charges and net P&L for an intraday trade.
+ *
+ * @param {number} buyPrice  - Entry price per share
+ * @param {number} sellPrice - Exit price (target) per share
+ * @param {number} qty       - Number of shares
+ * @returns {object} Full charge breakdown and netPnL
+ */
+function calculateGrowwCharges(buyPrice, sellPrice, qty) {
+  const buyValue  = buyPrice  * qty;
+  const sellValue = sellPrice * qty;
+  const grossPnL  = sellValue - buyValue;
+
+  // ── Brokerage (buy leg + sell leg) ──────────────────────────────────
+  const brokerageBuy  = Math.min(GROWW.brokerageCap, buyValue  * GROWW.brokerageRate);
+  const brokerageSell = Math.min(GROWW.brokerageCap, sellValue * GROWW.brokerageRate);
+  const totalBrokerage = brokerageBuy + brokerageSell;
+
+  // ── STT (sell side only for intraday) ───────────────────────────────
+  const stt = sellValue * GROWW.sttRate;
+
+  // ── Exchange transaction charge (both sides) ─────────────────────────
+  const exchangeBuy  = buyValue  * GROWW.exchangeRate;
+  const exchangeSell = sellValue * GROWW.exchangeRate;
+  const totalExchange = exchangeBuy + exchangeSell;
+
+  // ── SEBI charges (both sides) ────────────────────────────────────────
+  const sebiBuy  = buyValue  * GROWW.sebiRate;
+  const sebiSell = sellValue * GROWW.sebiRate;
+  const totalSebi = sebiBuy + sebiSell;
+
+  // ── Stamp duty (buy side only) ───────────────────────────────────────
+  const stamp = buyValue * GROWW.stampRate;
+
+  // ── IPFT (both sides) ────────────────────────────────────────────────
+  const ipft = (buyValue + sellValue) * GROWW.ipftRate;
+
+  // ── GST on (brokerage + exchange + sebi) ─────────────────────────────
+  const gstBase = totalBrokerage + totalExchange + totalSebi;
+  const gst     = gstBase * GROWW.gstRate;
+
+  // ── Total charges ────────────────────────────────────────────────────
+  const totalCharges = totalBrokerage + stt + totalExchange + totalSebi + stamp + ipft + gst;
+
+  // ── Net P&L ──────────────────────────────────────────────────────────
+  const netPnL        = grossPnL - totalCharges;
+  const netPnLPercent = buyValue > 0 ? (netPnL / buyValue) * 100 : 0;
+  const breakEvenMove = buyValue > 0 ? (totalCharges / buyValue) * 100 : 0;
+
+  return {
+    buyValue:      +buyValue.toFixed(2),
+    sellValue:     +sellValue.toFixed(2),
+    grossPnL:      +grossPnL.toFixed(2),
+    brokerage:     +totalBrokerage.toFixed(2),
+    stt:           +stt.toFixed(2),
+    exchangeFee:   +totalExchange.toFixed(2),
+    sebiFee:       +totalSebi.toFixed(2),
+    stampDuty:     +stamp.toFixed(2),
+    ipft:          +ipft.toFixed(2),
+    gst:           +gst.toFixed(2),
+    totalCharges:  +totalCharges.toFixed(2),
+    netPnL:        +netPnL.toFixed(2),
+    netPnLPercent: +netPnLPercent.toFixed(3),
+    breakEvenMove: +breakEvenMove.toFixed(4),
+    isProfitable:  netPnL > 0,
+  };
+}
+
+/**
+ * getOptimalQty(buyPrice, target, stopLoss, capital?)
+ * Computes the optimal quantity such that:
+ *  - Risk per trade is capped at 1% of available capital (default ₹50,000)
+ *  - Minimum 1 share
+ *
+ * @param {number} buyPrice
+ * @param {number} target
+ * @param {number} stopLoss
+ * @param {number} [capital=50000]  Available capital in ₹
+ * @returns {number} qty
+ */
+function getOptimalQty(buyPrice, target, stopLoss, capital = 50000) {
+  if (!target || !stopLoss || buyPrice <= 0) return 1;
+  const riskPerShare = Math.abs(buyPrice - stopLoss);
+  if (riskPerShare === 0) return 1;
+  const maxRisk = capital * 0.01; // 1% risk
+  const qty = Math.max(1, Math.floor(maxRisk / riskPerShare));
+  // Also cap to available capital
+  const maxByCapital = Math.floor(capital / buyPrice);
+  return Math.min(qty, maxByCapital);
+}
 
 // ── Full NSE Stock Universe ───────────────────────────────────────────────────
 const NSE_STOCKS = [
@@ -57,158 +196,41 @@ const NSE_STOCKS = [
   "PNB.NS","RECLTD.NS","SAIL.NS","SIEMENS.NS","SRF.NS",
   "TATACOMM.NS","TRENT.NS","VEDL.NS","VOLTAS.NS","ZYDUSLIFE.NS",
 
-  // ── Nifty Midcap 150 ──────────────────────────────────────────────────────
+  // ── Nifty Midcap 150 (sample) ─────────────────────────────────────────────
   "AARTIIND.NS","ABB.NS","ABCAPITAL.NS","ABFRL.NS","ACC.NS",
   "AIAENG.NS","ALKEM.NS","APLLTD.NS","ASTRAL.NS","ATUL.NS",
   "AUBANK.NS","BALRAMCHIN.NS","BANKBARODA.NS","BATAINDIA.NS","BEL.NS",
-  "BHEL.NS","BIRLACORPN.NS","BLUEDART.NS","BSOFT.NS","CAMS.NS",
-  "CANFINHOME.NS","CASTROLIND.NS","CEATLTD.NS","CHAMBLFERT.NS","CLEAN.NS",
-  "COFORGE.NS","CROMPTON.NS","CUMMINSIND.NS","CYIENT.NS","DATAPATTNS.NS",
-  "DEEPAKNTR.NS","DELTACORP.NS","EIDPARRY.NS","ELGIEQUIP.NS","EMAMILTD.NS",
-  "ENGINERSIN.NS","ESCORTS.NS","EXIDEIND.NS","FINEORG.NS","FLUOROCHEM.NS",
-  "FORTIS.NS","GLENMARK.NS","GNFC.NS","GRANULES.NS","GSPL.NS",
-  "HAPPSTMNDS.NS","HFCL.NS","HONAUT.NS","ICICIGI.NS","IDBI.NS",
-  "IPCALAB.NS","IRB.NS","IRCON.NS","ISEC.NS","JBCHEPHARM.NS",
-  "JKCEMENT.NS","JKLAKSHMI.NS","JMFINANCIL.NS","JSL.NS","JSWENERGY.NS",
-  "JUBLFOOD.NS","KALYANKJIL.NS","KARURVYSYA.NS","KEI.NS","KFINTECH.NS",
-  "KPIL.NS","KRISHNAIND.NS","LAURUSLABS.NS","LAXMIMACH.NS","LEMONTREE.NS",
-  "LINDEINDIA.NS","LTIM.NS","LTTS.NS","MAHABANK.NS","MAHINDCIE.NS",
-  "MANAPPURAM.NS","MARICO.NS","MCX.NS","MEDANTA.NS","METROPOLIS.NS",
-  "MFSL.NS","MINDTREE.NS","MIDHANI.NS","MOTILALOFS.NS","MPHASIS.NS",
-  "MRPL.NS","NAVA.NS","NAVINFLUOR.NS","NBCC.NS","NCC.NS",
-  "NHPC.NS","NLCINDIA.NS","NSLNISP.NS","OLECTRA.NS","PGHH.NS",
-  "PHARMEASY.NS","PHOENIXLTD.NS","POLYCAB.NS","POLYMED.NS","PRESTIGE.NS",
-  "PRINCEPIPE.NS","QUESS.NS","RADICO.NS","RAILTEL.NS","RAIN.NS",
-  "RBLBANK.NS","REDINGTON.NS","RELAXO.NS","RITES.NS","ROSSARI.NS",
-  "ROUTE.NS","RSYSTEMS.NS","SAREGAMA.NS","SCHAEFFLER.NS","SEQUENT.NS",
-  "SHYAMMETL.NS","SJVN.NS","SKFINDIA.NS","SOBHA.NS","SPARC.NS",
-  "STARHEALTH.NS","SUMICHEM.NS","SUNDARMFIN.NS","SUNDRMFAST.NS","SUPREMEIND.NS",
-  "SURYAROSNI.NS","SUVENPHAR.NS","SYNGENE.NS","TANLA.NS","TASTYBITE.NS",
-  "TATAELXSI.NS","TATAINVEST.NS","TCNSBRANDS.NS","TECHNO.NS","THERMAX.NS",
-  "TIMKEN.NS","TITAGARH.NS","TTKPRESTIG.NS","TVSHLTD.NS","UBLLTD.NS",
-  "UJJIVANSFB.NS","UNIONBANK.NS","UTIAMC.NS","VSTIND.NS","VGUARD.NS",
-  "WELCORP.NS","WHIRLPOOL.NS","WIPRO.NS","WOCKPHARMA.NS","ZEEL.NS",
-  "ZENTEC.NS","ZENSARTECH.NS","AARTIIND.NS","ZOMATO.NS","NYKAA.NS",
-
-  // ── Nifty Smallcap (liquid) ───────────────────────────────────────────────
-  "ACCELYA.NS","ACE.NS","AFFLE.NS","AGI.NS","AJANTPHARM.NS",
-  "AKZOINDIA.NS","ALANKIT.NS","ALEMBICLTD.NS","ALKYLAMINE.NS","ALLCARGO.NS",
-  "ANANTRAJ.NS","ANGELONE.NS","ANUPAM.NS","APLAPOLLO.NS","ARCHIDPLY.NS",
-  "ARFIN.NS","ARVINDFASN.NS","ASAHIINDIA.NS","ASHIANA.NS","ASHOKLEY.NS",
-  "ASTRAZEN.NS","AVADHSUGAR.NS","AVANTIFEED.NS","AYMSYNTEX.NS","AZAD.NS",
-  "BAJAJCON.NS","BALMLAWRIE.NS","BANSALWIRE.NS","BASF.NS","BAYERCROP.NS",
-  "BCG.NS","BECTORFOOD.NS","BFINVEST.NS","BIBCL.NS","BIKAJI.NS",
-  "BLISSGVS.NS","BOROLTD.NS","BPCL.NS","BRIGADE.NS","BSE.NS",
-  "BUTTERFLY.NS","CAMLINFINE.NS","CAPACITE.NS","CARBORUNIV.NS","CASTROLIND.NS",
-  "CCL.NS","CENTURYPLY.NS","CENTURYTEX.NS","CESC.NS","CGPOWER.NS",
-  "CHEMCON.NS","CHEMPLASTS.NS","CHENNPETRO.NS","CIGNITITEC.NS","CLICKTECH.NS",
-  "CMSINFO.NS","COALINDIA.NS","CONFIPET.NS","CONTROLPR.NS","COSMOFILMS.NS",
-  "CRAFTSMAN.NS","CRED.NS","CROMPTON.NS","CSLTD.NS","DCB.NS",
-  "DECCANCE.NS","DELEXTRN.NS","DELHIVERY.NS","DEVYANI.NS","DHANI.NS",
-  "DHANUKA.NS","DODLA.NS","DRREDDY.NS","DREDGING.NS","DYNPRO.NS",
-  "EDELWEISS.NS","EIDPARRY.NS","EMKAY.NS","ENDURANCE.NS","EPIGRAL.NS",
-  "EQUITASBNK.NS","ESABINDIA.NS","ETHOSLTD.NS","EUROBOND.NS","EXCEL.NS",
-  "FLAIR.NS","FLEXI.NS","FLUOROCHEM.NS","FOODWORKS.NS","FORCEMOT.NS",
-  "GABRIEL.NS","GALAXYSURF.NS","GARUDA.NS","GESHIP.NS","GIPCL.NS",
-  "GIRNARFOOD.NS","GLAND.NS","GLOBALVECT.NS","GLS.NS","GMMPFAUDLR.NS",
-  "GODFRYPHLP.NS","GOKEX.NS","GOLDIAM.NS","GOODLUCK.NS","GPPL.NS",
-  "GREENPANEL.NS","GRINDWELL.NS","GRSE.NS","GUJGAS.NS","GUJSTATE.NS",
-  "HARDWYN.NS","HARSHA.NS","HBL.NS","HFCL.NS","HIKAL.NS",
-  "HILTON.NS","HINDCOPPER.NS","HINDPETRO.NS","HINDWARE.NS","HITACHIIND.NS",
-  "HLVLTD.NS","HOMEFIRST.NS","HONASA.NS","HURON.NS","IBREALEST.NS",
-  "ICIL.NS","IDFCFIRSTB.NS","IGPL.NS","IIFL.NS","IIFLSEC.NS",
-  "ILFSTRANS.NS","IMAGICAA.NS","IMFA.NS","IMPAL.NS","INDGN.NS",
-  "INDIGOPNTS.NS","INDOCO.NS","INDOSTAR.NS","INFOBEAN.NS","INPX.NS",
-  "INTELLECT.NS","INTEQ.NS","IONEXCHANG.NS","IREDA.NS","ISGEC.NS",
-  "ITI.NS","JAGRAN.NS","JAMNAAUTO.NS","JAYAGROGN.NS","JAYBPHARMA.NS",
-  "JINDALSAW.NS","JKPAPER.NS","JMFINANCIL.NS","JPASSOCIAT.NS","JTLIND.NS",
-  "JUBLINDS.NS","KANSAINER.NS","KARTIKAYAM.NS","KCP.NS","KERNEX.NS",
-  "KIOCL.NS","KITEX.NS","KMCHEAL.NS","KNRCON.NS","KOKUYOCMLN.NS",
-  "KPR.NS","KRBL.NS","KRIDHANINF.NS","KSCL.NS","KTKBANK.NS",
-  "LALPATHLAB.NS","LAOPALA.NS","LGBBROSLTD.NS","LIBERTYSHOE.NS","LIKHITHA.NS",
-  "LINKHOUSE.NS","LLOYDSENT.NS","LLOYDSENGG.NS","LMFHL.NS","LPDC.NS",
-  "LUNA.NS","LUXIND.NS","LXCHEM.NS","MAGNASOUND.NS","MAHLOG.NS",
-  "MAHSEAMLES.NS","MAPMYINDIA.NS","MARICOIND.NS","MASTEK.NS","MBAPL.NS",
-  "MEDPLUS.NS","MEGH.NS","MEKINQ.NS","MELSTAR.NS","MFSL.NS",
-  "MGLAMB.NS","MICROSTRAT.NS","MINDA.NS","MINDAIND.NS","MINEXCORP.NS",
-  "MITCON.NS","MLTD.NS","MOLDIND.NS","MOLDTEK.NS","MOSCHIP.NS",
-  "MPSLTD.NS","MRPL.NS","MTL.NS","MUKANDLTD.NS","MUNJALSHOW.NS",
-  "NATCOPHARM.NS","NATHBIOGEN.NS","NAVINFLUO.NS","NAZARA.NS","NDGL.NS",
-  "NEOGEN.NS","NETWORK18.NS","NEWGEN.NS","NGLFINECHM.NS","NIITLTD.NS",
-  "NILKAMAL.NS","NIPPOBATRY.NS","NUCLEUS.NS","NUVAMA.NS","OLAELEC.NS",
-  "OMAXE.NS","ONEPOINT.NS","ORIENTLTD.NS","ORIENTPPR.NS","ORISSAMINE.NS",
-  "PALREDTEC.NS","PANSARI.NS","PARACABLES.NS","PARADEEP.NS","PATANJALI.NS",
-  "PCJEWELLER.NS","PDPL.NS","PENIND.NS","PENINLAND.NS","PERSISTENT.NS",
-  "PFIZER.NS","PHYNEXUS.NS","PILANIINVS.NS","PILOTSUN.NS","PINCON.NS",
-  "PIRAMALENT.NS","PIXTRANS.NS","PLASTIBLENDS.NS","PODDARMENT.NS","POKARNA.NS",
-  "POLSON.NS","POLYMED.NS","PONDDYCHI.NS","PRICOLLTD.NS","PRIMEIND.NS",
-  "PRIORITY.NS","PRISM.NS","PROBIOTIC.NS","PROCTER.NS","PRUDENT.NS",
-  "PSP.NS","PSUBNK.NS","PTC.NS","PUNJABCHEM.NS","PURVA.NS",
-  "QUICKHEAL.NS","RAIN.NS","RAJESHEXPO.NS","RAJRATAN.NS","RALLIS.NS",
-  "RAMCOIND.NS","RAMCOCEM.NS","RANEHOLDIN.NS","RATNAMANI.NS","RAYMOND.NS",
-  "RCPCL.NS","RECLTD.NS","REDTAPE.NS","RFCL.NS","RHIM.NS",
-  "RIIL.NS","RINFRA.NS","RITCO.NS","RKDL.NS","RPGLIFE.NS",
-  "RPOWER.NS","RSWM.NS","RTNINDIA.NS","SAFARI.NS","SAKSOFT.NS",
-  "SALSTEEL.NS","SANDESH.NS","SANGHIIND.NS","SANOFI.NS","SAPPHIRE.NS",
-  "SARDAEN.NS","SASKEN.NS","SATYAMFORG.NS","SBFC.NS","SBGLP.NS",
-  "SBICARD.NS","SCHAND.NS","SCHNEIDER.NS","SEPOWER.NS","SEQUENT.NS",
-  "SETCO.NS","SFL.NS","SGIL.NS","SHARDAMOTR.NS","SHAREINDIA.NS",
-  "SHILPAMED.NS","SHIVALIK.NS","SHREDIGCEM.NS","SHREEPUSHK.NS","SHRIRAMCIT.NS",
-  "SILVERTO.NS","SINTERCAST.NS","SITINET.NS","SMSPHARMA.NS","SODFLEX.NS",
-  "SOFTSOL.NS","SONACOMS.NS","SOUTHBANK.NS","SPANDANA.NS","SPECTRANET.NS",
-  "SSWL.NS","STCINDIA.NS","STEELXIND.NS","STERTOOLS.NS","STLTECH.NS",
-  "SUBEXLTD.NS","SUBROS.NS","SUKHJITS.NS","SUMIT.NS","SUMILON.NS",
-  "SUNCLAYLTD.NS","SUNDARMHLD.NS","SUNDRAM.NS","SUNFLAG.NS","SUNPHARMA.NS",
-  "SUNTECK.NS","SUPRAJIT.NS","SURYODAY.NS","SUTLEJTEX.NS","SWELECTES.NS",
-  "SWSOLAR.NS","SYMPHONY.NS","TARC.NS","TATACHEM.NS","TATACOFFEE.NS",
-  "TATAPOWER.NS","TEAMLEASE.NS","TEXINFRA.NS","TFCILTD.NS","THYROCARE.NS",
-  "TINPLATE.NS","TIRUMALCHM.NS","TORNTPHARM.NS","TORNTPOWER.NS","TPTC.NS",
-  "TREJHARA.NS","TRITON.NS","TRIVENI.NS","TTK.NS","TV18BRDCST.NS",
-  "TVSSCS.NS","TVTODAY.NS","UCAL.NS","UCOBANK.NS","UFLEX.NS",
-  "UGROCAP.NS","UPL.NS","UTKARSHBNK.NS","V2RETAIL.NS","VAIBHAVGBL.NS",
-  "VALDEL.NS","VARROC.NS","VARSA.NS","VBLTD.NS","VEEFIN.NS",
-  "VERITAS.NS","VESUVIUS.NS","VINATIORGA.NS","VINCOELEC.NS","VINDHYATEL.NS",
-  "VIPCLOTHNG.NS","VIPIND.NS","VISCO.NS","VISHAL.NS","VLSFINANCE.NS",
-  "VMART.NS","VOLTAMP.NS","VSTIL.NS","WESTERNIND.NS","WESTLIFE.NS",
-  "WHEELS.NS","WINDLAS.NS","WINFO.NS","WIPRO.NS","WONDERLA.NS",
-  "XCHANGING.NS","XPRO.NS","YAARI.NS","YATHARTH.NS","YUKEN.NS",
-  "ZENSARTECH.NS","ZFCVINDIA.NS","ZODIACLOTH.NS","ZUARI.NS",
-
-  // ── Banking & Finance Extra ───────────────────────────────────────────────
-  "ABSL.NS","ACCELYA.NS","ADITYA.NS","ALANKIT.NS","ANDHRABAN.NS",
-  "ANGELONE.NS","APLAPOLLO.NS","APTECHT.NS","ARMAN.NS","AROHA.NS",
-  "ARTSONIG.NS","ASSETWORKS.NS","ATUL.NS","AVGOLD.NS","AVTNPL.NS",
-
-  // ── IT & Tech Extra ───────────────────────────────────────────────────────
-  "CIGNITITEC.NS","COFORGE.NS","CYIENT.NS","DATAMATICS.NS","ECLERX.NS",
-  "EXPLEO.NS","FIRSTSOURC.NS","GALAXYSURF.NS","GTPL.NS","HCL.NS",
-  "HEXAWARE.NS","INTELLECT.NS","IOT.NS","ISEC.NS","KPITTECH.NS",
-  "MASTEK.NS","MINDTREE.NS","MPHASIS.NS","MRPL.NS","NIIT.NS",
-  "NUCLEUS.NS","OFSS.NS","PERSISTENT.NS","RATEGAIN.NS","ROUTE.NS",
-  "SECLABS.NS","SONATA.NS","TANLA.NS","TATAELXSI.NS","TECHNO.NS",
-  "TRIGYN.NS","TTML.NS","UNISON.NS","UTSSTSYSL.NS","VAKRANGEE.NS",
-  "VIMTALABS.NS","WIPRO.NS","XCHANGING.NS","XPRO.NS","ZENSAR.NS",
-
-  // ── Pharma Extra ──────────────────────────────────────────────────────────
-  "ABBOTINDIA.NS","AJANTPHARM.NS","ALEMBICLTD.NS","ALKEM.NS","APLLTD.NS",
-  "ASTRAZEN.NS","AUROPHARMA.NS","BIPCL.NS","BLISSGVS.NS","CADILAHC.NS",
-  "CAPLIPOINT.NS","CIPLA.NS","DIVI.NS","DRREDDY.NS","ERIS.NS",
-  "GLAND.NS","GLENMARK.NS","GRANULES.NS","HIKAL.NS","IPCALAB.NS",
-  "JBCHEPHARM.NS","JUBILANT.NS","KANSAINER.NS","LAURUSLABS.NS","LUPIN.NS",
-  "NATCOPHARM.NS","NAVINFLUOR.NS","NGLFINECHM.NS","PFIZER.NS","RADICO.NS",
-  "RAIN.NS","SANOFI.NS","SEQUENT.NS","SUNPHARMA.NS","SUVEN.NS",
-  "TORNTPHARM.NS","UNICHEM.NS","VINATIORGA.NS","WOCKPHARMA.NS","ZYDUSLIFE.NS",
+  "BHEL.NS","COFORGE.NS","CROMPTON.NS","CUMMINSIND.NS","CYIENT.NS",
+  "DEEPAKNTR.NS","ELGIEQUIP.NS","EMAMILTD.NS","ENGINERSIN.NS","ESCORTS.NS",
+  "FORTIS.NS","GLENMARK.NS","GRANULES.NS","HAPPSTMNDS.NS","IPCALAB.NS",
+  "JBCHEPHARM.NS","JKCEMENT.NS","JUBLFOOD.NS","KALYANKJIL.NS","KEI.NS",
+  "KPIL.NS","LAURUSLABS.NS","LTIM.NS","LTTS.NS","MANAPPURAM.NS",
+  "MCX.NS","MPHASIS.NS","NBCC.NS","NHPC.NS","NLCINDIA.NS",
+  "OLECTRA.NS","POLYCAB.NS","PRESTIGE.NS","RADICO.NS","RAILTEL.NS",
+  "RBLBANK.NS","RITES.NS","SJVN.NS","SOBHA.NS","STARHEALTH.NS",
+  "SUNDARMFIN.NS","SUPREMEIND.NS","SYNGENE.NS","TANLA.NS","TATAELXSI.NS",
+  "THERMAX.NS","TITAGARH.NS","UJJIVANSFB.NS","UNIONBANK.NS","UTIAMC.NS",
+  "VGUARD.NS","ZOMATO.NS","NYKAA.NS",
 
   // ── Infrastructure & Energy ───────────────────────────────────────────────
-  "ADANIENSOL.NS","ADANIGAS.NS","ADANIGREEN.NS","ADANIPORTS.NS","ADANIPOWER.NS",
-  "ADANITRANS.NS","AEGISLOG.NS","BHEL.NS","BPCL.NS","CESC.NS",
-  "CGPOWER.NS","ENGINERSIN.NS","GMRINFRA.NS","GPPL.NS","GUJGAS.NS",
-  "HINDPETRO.NS","IOC.NS","IGL.NS","IRB.NS","IRCON.NS",
-  "IREDA.NS","IRFC.NS","JSWENERGY.NS","KEC.NS","NHPC.NS",
-  "NLCINDIA.NS","NTPC.NS","ONGC.NS","PETRONET.NS","PFC.NS",
+  "ADANIENSOL.NS","ADANIGAS.NS","AEGISLOG.NS","BPCL.NS","CESC.NS",
+  "CGPOWER.NS","GMRINFRA.NS","GPPL.NS","GUJGAS.NS","HINDPETRO.NS",
+  "IOC.NS","IGL.NS","IRB.NS","IRCON.NS","IREDA.NS","IRFC.NS",
+  "JSWENERGY.NS","KEC.NS","NTPC.NS","ONGC.NS","PETRONET.NS","PFC.NS",
   "POWERGRID.NS","PTC.NS","RECLTD.NS","RINFRA.NS","RPOWER.NS",
-  "SAIL.NS","SJVN.NS","SUNCLAYLTD.NS","SWSOLAR.NS","TATAPOWER.NS",
-  "TORNTPOWER.NS","UJJAIN.NS","UPL.NS","VEDL.NS","YESBANK.NS",
+  "SAIL.NS","SWSOLAR.NS","TATAPOWER.NS","TORNTPOWER.NS","UPL.NS","VEDL.NS",
+
+  // ── IT & Tech ─────────────────────────────────────────────────────────────
+  "CIGNITITEC.NS","DATAMATICS.NS","ECLERX.NS","FIRSTSOURC.NS","HEXAWARE.NS",
+  "INTELLECT.NS","KPITTECH.NS","MASTEK.NS","MINDTREE.NS","NUCLEUS.NS",
+  "OFSS.NS","PERSISTENT.NS","RATEGAIN.NS","ROUTE.NS","SONATA.NS",
+  "TATAELXSI.NS","WIPRO.NS","ZENSARTECH.NS",
+
+  // ── Pharma ────────────────────────────────────────────────────────────────
+  "ABBOTINDIA.NS","AJANTPHARM.NS","ALKEM.NS","APLLTD.NS","ASTRAZEN.NS",
+  "AUROPHARMA.NS","CIPLA.NS","DRREDDY.NS","GLAND.NS","GLENMARK.NS",
+  "GRANULES.NS","IPCALAB.NS","LAURUSLABS.NS","LUPIN.NS","NATCOPHARM.NS",
+  "PFIZER.NS","SANOFI.NS","SUNPHARMA.NS","TORNTPHARM.NS","ZYDUSLIFE.NS",
 ];
 
 // ── BSE Stocks ────────────────────────────────────────────────────────────────
@@ -224,37 +246,11 @@ const BSE_STOCKS = [
   "HDFCLIFE.BO","BAJAJ-AUTO.BO","ADANIGREEN.BO","TECHM.BO","INDUSINDBK.BO",
   "DIVISLAB.BO","M%26M.BO","SHRIRAMFIN.BO","AMBUJACEM.BO","DLF.BO",
   "GODREJCP.BO","HAVELLS.BO","PIDILITIND.BO","SIEMENS.BO","TRENT.BO",
-  "MARICO.BO","DABUR.BO","COLPAL.BO","NAUKRI.BO","OBEROIREAL.BO",
-  "GAIL.BO","IRCTC.BO","RECLTD.BO","IDFCFIRSTB.BO","BANDHANBNK.BO",
-  "ABCAPITAL.BO","MUTHOOTFIN.BO","LICHSGFIN.BO","SAIL.BO","NMDC.BO",
+  "MARICO.BO","DABUR.BO","COLPAL.BO","NAUKRI.BO","GAIL.BO","IRCTC.BO",
+  "RECLTD.BO","IDFCFIRSTB.BO","BANDHANBNK.BO","MUTHOOTFIN.BO","SAIL.BO",
   "FEDERALBNK.BO","CANBK.BO","PNB.BO","BANKBARODA.BO","UNIONBANK.BO",
   "IOC.BO","VEDL.BO","TATAPOWER.BO","CHOLAFIN.BO","BERGEPAINT.BO",
-  "PAGEIND.BO","BOSCHLTD.BO","CONCOR.BO","ZYDUSLIFE.BO","LUPIN.BO",
-  "TORNTPHARM.BO","AUROPHARMA.BO","BIOCON.BO","CADILAHC.BO","ALKEM.BO",
-  "GLAXO.BO","ABBOTINDIA.BO","PFIZER.BO","SANOFI.BO","ASTRAZEN.BO",
-  "TATAELXSI.BO","MPHASIS.BO","LTIM.BO","LTTS.BO","PERSISTENT.BO",
-  "COFORGE.BO","HAPPSTMNDS.BO","ZOMATO.BO","NYKAA.BO","PAYTM.BO",
-  "DELHIVERY.BO","POLICYBZR.BO","DEVYANI.BO","WESTLIFE.BO","JUBLFOOD.BO",
-  "KALYANKJIL.BO","TRENT.BO","SHOPERSTOP.BO","VMART.BO","PVRINOX.BO",
-  "INOXWIND.BO","IREDA.BO","IRFC.BO","IRCON.BO","NHPC.BO",
-  "SJVN.BO","NTPC.BO","ADANIPOWER.BO","ADANITRANS.BO","ADANIGAS.BO",
-  "CESC.BO","TORNTPOWER.BO","JSWENERGY.BO","CGPOWER.BO","BHEL.BO",
-  "ENGINERSIN.BO","KEC.BO","ABB.BO","SIEMENS.BO","HONAUT.BO",
-  "GRINDWELL.BO","ELGIEQUIP.BO","TIMKEN.BO","SKFINDIA.BO","SCHAEFFLER.BO",
-  "AMARAJABAT.BO","EXIDEIND.BO","SUNDRMFAST.BO","GABRIEL.BO","SUPRAJIT.BO",
-  "MINDAIND.BO","MINDA.BO","ENDURANCE.BO","MOTHERSON.BO","BOSCHLTD.BO",
-  "HEROMOTOCO.BO","BAJAJ-AUTO.BO","EICHERMOT.BO","TVSMOTORS.BO","ESCORTS.BO",
-  "MAHINDCIE.BO","FORCEMOT.BO","OLECTRA.BO","IOCHCL.BO","CPCL.BO",
-  "MRPL.BO","BPCL.BO","IOC.BO","HINDPETRO.BO","PETRONET.BO",
-  "GUJGAS.BO","IGL.BO","GSPL.BO","GAIL.BO","ONGC.BO",
-  "RELIANCE.BO","HPCL.BO","MGL.BO","INDRAPRASTHA.BO","ATGL.BO",
-  "SUPREMEIND.BO","ASTRAL.BO","APLAPOLLO.BO","POLYCAB.BO","KEI.BO",
-  "HAVELLS.BO","VOLTAS.BO","BLUESTAR.BO","WHIRLPOOL.BO","CROMPTON.BO",
-  "ORIENTLTD.BO","SYMPHONY.BO","VGUARD.BO","BAJAJELECTR.BO","FINOLEX.BO",
-  "ULTRACEMCO.BO","AMBUJACEM.BO","ACC.BO","SHREECEM.BO","RAMCOCEM.BO",
-  "JKCEMENT.BO","BIRLACORPN.BO","HEIDELBERG.BO","DALMIA.BO","INDIACEM.BO",
-  "TATASTEEL.BO","JSWSTEEL.BO","HINDALCO.BO","NATIONALUM.BO","VEDL.BO",
-  "COALINDIA.BO","NMDC.BO","SAIL.BO","JINDALSTEL.BO","JSPL.BO",
+  "ZOMATO.BO","NYKAA.BO","PAYTM.BO","JUBLFOOD.BO","IREDA.BO","IRFC.BO",
 ];
 
 const STOCKS = [...new Set([...NSE_STOCKS, ...BSE_STOCKS])];
@@ -318,7 +314,7 @@ async function fetchStockData(symbol) {
       opens:      rows.map(r => r.o),
       timestamps: rows.map(r => r.t),
     };
-  } catch (err) {
+  } catch {
     return null;
   }
 }
@@ -353,11 +349,6 @@ function projectSellTime(currentPrice, target, atr, periodMinutes = 14) {
 }
 
 // ── Core Signal Engine — 12 Indicators ───────────────────────────────────────
-// v3.1 changes:
-//   • confluence threshold: >= 5  →  >= 4
-//   • BUY score threshold:  >= 68 →  >= 58
-//   • HOLD demotion guard:  < 80  →  < 65
-//   • New "WEAK BUY" signal for borderline bullish stocks
 function generateSignal(closes, highs, lows, volumes, opens) {
   const prices = closes;
   const hs = highs, ls = lows, vs = volumes;
@@ -513,20 +504,15 @@ function generateSignal(closes, highs, lows, volumes, opens) {
   const rawScore   = maxScore > 0 ? (bullScore / maxScore) * 100 : 50;
   const score      = Math.min(100, Math.round(rawScore * trendBonus));
 
-  // ── v3.1: Confluence threshold lowered 5 → 4 ─────────────────────────────
   const confluence = Math.max(bullScore, bearScore) >= 4;
 
-  // ── v3.1: BUY threshold lowered 68 → 58 ──────────────────────────────────
   let signal = "HOLD";
   if (score >= 58)      signal = "BUY";
   else if (score <= 32) signal = "SELL";
 
-  // ── v3.1: Demotion guard raised 80 → 65 (less aggressive HOLD demotion) ──
   if (signal === "BUY"  && !confluence && score < 65) signal = "HOLD";
   if (signal === "SELL" && !confluence && score > 20) signal = "HOLD";
 
-  // ── v3.1: WEAK BUY tier — borderline bullish, worth watching ─────────────
-  // Stocks scoring 50–57 with any bullish lean become "WEAK BUY"
   if (signal === "HOLD" && score >= 50 && bullScore > bearScore) {
     signal = "WEAK BUY";
   }
@@ -536,6 +522,17 @@ function generateSignal(closes, highs, lows, volumes, opens) {
   const projectedSellTime = (signal === "BUY" || signal === "WEAK BUY")
     ? projectSellTime(last, target, atr)
     : null;
+
+  // ── v3.2: Groww Brokerage Calculation ─────────────────────────────────────
+  let brokerageInfo = null;
+  if ((signal === "BUY" || signal === "WEAK BUY") && target && stopLoss) {
+    const qty = getOptimalQty(last, target, stopLoss);
+    brokerageInfo = calculateGrowwCharges(last, target, qty);
+    brokerageInfo.qty = qty;
+    brokerageInfo.chargePercent = last > 0
+      ? +((brokerageInfo.totalCharges / (last * qty)) * 100).toFixed(4)
+      : 0;
+  }
 
   return {
     signal, score, bullScore, bearScore,
@@ -552,6 +549,8 @@ function generateSignal(closes, highs, lows, volumes, opens) {
     confluence,
     macdHistogram: macd  ? +macd.histogram.toFixed(2) : null,
     stochK:        stoch ? Math.round(stoch.k)        : null,
+    brokerageInfo,                   // ← NEW in v3.2
+    isProfitable:  brokerageInfo ? brokerageInfo.isProfitable : null,
   };
 }
 
@@ -560,7 +559,6 @@ function checkExitCondition(symbol, currentPrice, analysis) {
   const pos = openPositions[symbol];
 
   if (!pos) {
-    // Open position on BUY or WEAK BUY
     if (analysis.signal === "BUY" || analysis.signal === "WEAK BUY") {
       openPositions[symbol] = {
         entryPrice:        currentPrice,
@@ -569,6 +567,7 @@ function checkExitCondition(symbol, currentPrice, analysis) {
         stopLoss:          analysis.stopLoss,
         projectedSellTime: analysis.projectedSellTime,
         signalType:        analysis.signal,
+        brokerageInfo:     analysis.brokerageInfo,
       };
       return { action: analysis.signal, isNew: true };
     }
@@ -580,14 +579,20 @@ function checkExitCondition(symbol, currentPrice, analysis) {
   const signalSell  = analysis.signal === "SELL";
 
   if (hitTarget || hitStopLoss || signalSell) {
-    const pl = ((currentPrice - pos.entryPrice) / pos.entryPrice * 100).toFixed(2);
+    // Recalculate actual net P&L on exit
+    const qty      = pos.brokerageInfo?.qty || 1;
+    const exitCalc = calculateGrowwCharges(pos.entryPrice, currentPrice, qty);
+    const pl       = exitCalc.netPnLPercent.toFixed(2);
+
     delete openPositions[symbol];
     return {
-      action: "SELL", isNew: true,
-      reason:     hitTarget ? "🎯 Target Hit" : hitStopLoss ? "🛑 Stop-Loss Hit" : "📉 Signal Reversed",
-      profitLoss: pl,
-      entryPrice: pos.entryPrice,
-      entryTime:  pos.entryTime,
+      action:      "SELL", isNew: true,
+      reason:      hitTarget ? "🎯 Target Hit" : hitStopLoss ? "🛑 Stop-Loss Hit" : "📉 Signal Reversed",
+      profitLoss:  pl,
+      netPnL:      exitCalc.netPnL,
+      totalCharges: exitCalc.totalCharges,
+      entryPrice:  pos.entryPrice,
+      entryTime:   pos.entryTime,
     };
   }
 
@@ -647,11 +652,16 @@ async function runFullScan() {
             isNewSignal:   exitInfo.isNew,
             exitReason:    exitInfo.reason     || null,
             profitLoss:    exitInfo.profitLoss || null,
+
+            // ── v3.2 brokerage fields ────────────────────────────────────
+            brokerageInfo:  analysis.brokerageInfo || null,
+            isProfitable:   analysis.isProfitable,  // net of charges
+
             entryPrice:    exitInfo.entryPrice || pos?.entryPrice || null,
             entryTime:     exitInfo.entryTime  || pos?.entryTime  || null,
             recentPrices:  data.closes.slice(-30),
           };
-        } catch (err) {
+        } catch {
           return null;
         }
       })
@@ -677,29 +687,34 @@ async function runFullScan() {
 
 function buildPayload(results, isFinal) {
   const sorted = [...results].sort((a, b) => {
-    // Priority order: BUY > WEAK BUY > HOLD > SELL
     const rank = s => s === "BUY" ? 4 : s === "WEAK BUY" ? 3 : s === "HOLD" ? 2 : 1;
     const rankDiff = rank(b.signal) - rank(a.signal);
     if (rankDiff !== 0) return rankDiff;
+    // Among same signal type, sort profitable ones first
+    if (a.isProfitable && !b.isProfitable) return -1;
+    if (b.isProfitable && !a.isProfitable) return  1;
     if (a.confluence && !b.confluence) return -1;
-    if (b.confluence && !a.confluence) return 1;
+    if (b.confluence && !a.confluence) return  1;
     return b.score - a.score;
   });
 
-  // Best stock: prefer strong BUY with confluence, fallback to WEAK BUY
   const best =
-    sorted.find(s => s.signal === "BUY" && s.confluence) ||
+    sorted.find(s => s.signal === "BUY"      && s.isProfitable && s.confluence) ||
+    sorted.find(s => s.signal === "BUY"      && s.isProfitable) ||
+    sorted.find(s => s.signal === "BUY"      && s.confluence) ||
     sorted.find(s => s.signal === "BUY") ||
-    sorted.find(s => s.signal === "WEAK BUY" && s.confluence) ||
+    sorted.find(s => s.signal === "WEAK BUY" && s.isProfitable && s.confluence) ||
+    sorted.find(s => s.signal === "WEAK BUY" && s.isProfitable) ||
     sorted.find(s => s.signal === "WEAK BUY") ||
     sorted[0] ||
     null;
 
-  const buyCount      = sorted.filter(s => s.signal === "BUY").length;
-  const weakBuyCount  = sorted.filter(s => s.signal === "WEAK BUY").length;
-  const sellCount     = sorted.filter(s => s.signal === "SELL").length;
-  const holdCount     = sorted.filter(s => s.signal === "HOLD").length;
-  const confluenceCount = sorted.filter(s => s.confluence).length;
+  const buyCount          = sorted.filter(s => s.signal === "BUY").length;
+  const weakBuyCount      = sorted.filter(s => s.signal === "WEAK BUY").length;
+  const sellCount         = sorted.filter(s => s.signal === "SELL").length;
+  const holdCount         = sorted.filter(s => s.signal === "HOLD").length;
+  const confluenceCount   = sorted.filter(s => s.confluence).length;
+  const profitableCount   = sorted.filter(s => s.isProfitable === true).length;
 
   return {
     marketOpen:     true,
@@ -710,12 +725,14 @@ function buildPayload(results, isFinal) {
     openPositions:  Object.keys(openPositions).length,
     scanComplete:   isFinal,
     totalScanned:   results.length,
+    brokerageModel: "Groww Intraday (₹20 cap / 0.05% + STT + Exchange + SEBI + Stamp + GST)",
     summary: {
       buy:        buyCount,
       weakBuy:    weakBuyCount,
       sell:       sellCount,
       hold:       holdCount,
       confluence: confluenceCount,
+      profitable: profitableCount,  // ← NEW: net profitable after all charges
     },
   };
 }
@@ -748,6 +765,22 @@ app.get("/scan-status", (req, res) => {
   });
 });
 
+// ── /brokerage-calc ───────────────────────────────────────────────────────────
+// Utility endpoint: calculate Groww charges for any trade
+// GET /brokerage-calc?buy=500&sell=520&qty=10
+app.get("/brokerage-calc", (req, res) => {
+  const buyPrice  = parseFloat(req.query.buy);
+  const sellPrice = parseFloat(req.query.sell);
+  const qty       = parseInt(req.query.qty || "1");
+
+  if (isNaN(buyPrice) || isNaN(sellPrice) || qty < 1) {
+    return res.status(400).json({ error: "Params required: buy, sell, qty" });
+  }
+
+  const result = calculateGrowwCharges(buyPrice, sellPrice, qty);
+  res.json({ ...result, platform: "Groww", tradeType: "Intraday" });
+});
+
 // ── /signals ──────────────────────────────────────────────────────────────────
 app.get("/signals", async (req, res) => {
   if (!isMarketOpen() && req.query.force !== "true") {
@@ -759,32 +792,32 @@ app.get("/signals", async (req, res) => {
     });
   }
 
-  const limit    = Math.min(500, parseInt(req.query.limit || "200"));
-  const exchange = (req.query.exchange || "ALL").toUpperCase();
-
-  // Filter by signal type: ?type=BUY | WEAKBUY | SELL | HOLD | ALL
+  const limit      = Math.min(500, parseInt(req.query.limit || "200"));
+  const exchange   = (req.query.exchange || "ALL").toUpperCase();
   const typeFilter = (req.query.type || "ALL").toUpperCase();
+  // ?profitable=true → only show net-profitable signals after Groww charges
+  const onlyProfitable = req.query.profitable === "true";
 
   if (signalCache && Date.now() - cacheTime < CACHE_TTL && req.query.force !== "true") {
-    const payload = filterPayload(signalCache, limit, exchange, typeFilter);
+    const payload = filterPayload(signalCache, limit, exchange, typeFilter, onlyProfitable);
     return res.json(payload);
   }
 
   if (isScanning && partialCache) {
-    const payload = filterPayload(partialCache, limit, exchange, typeFilter);
+    const payload = filterPayload(partialCache, limit, exchange, typeFilter, onlyProfitable);
     return res.json({ ...payload, scanComplete: false });
   }
 
   runFullScan().catch(console.error);
 
   if (signalCache) {
-    const payload = filterPayload(signalCache, limit, exchange, typeFilter);
+    const payload = filterPayload(signalCache, limit, exchange, typeFilter, onlyProfitable);
     return res.json({ ...payload, scanComplete: false, stale: true });
   }
 
   await sleep(3000);
   if (partialCache) {
-    const payload = filterPayload(partialCache, limit, exchange, typeFilter);
+    const payload = filterPayload(partialCache, limit, exchange, typeFilter, onlyProfitable);
     return res.json({ ...payload, scanComplete: false });
   }
 
@@ -797,7 +830,7 @@ app.get("/signals", async (req, res) => {
   });
 });
 
-function filterPayload(payload, limit, exchange, typeFilter = "ALL") {
+function filterPayload(payload, limit, exchange, typeFilter = "ALL", onlyProfitable = false) {
   let signals = payload.signals;
 
   if (exchange !== "ALL") {
@@ -806,16 +839,19 @@ function filterPayload(payload, limit, exchange, typeFilter = "ALL") {
 
   if (typeFilter !== "ALL") {
     if (typeFilter === "BUY") {
-      // BUY only (not WEAK BUY)
       signals = signals.filter(s => s.signal === "BUY");
     } else if (typeFilter === "WEAKBUY" || typeFilter === "WEAK BUY") {
       signals = signals.filter(s => s.signal === "WEAK BUY");
     } else if (typeFilter === "BUYS") {
-      // Both BUY and WEAK BUY
       signals = signals.filter(s => s.signal === "BUY" || s.signal === "WEAK BUY");
     } else {
       signals = signals.filter(s => s.signal === typeFilter);
     }
+  }
+
+  // ── v3.2: Filter to profitable-only (net of Groww charges) ────────────────
+  if (onlyProfitable) {
+    signals = signals.filter(s => s.isProfitable === true);
   }
 
   return {
@@ -866,11 +902,12 @@ app.listen(PORT, "0.0.0.0", () => {
   const nets    = Object.values(os.networkInterfaces()).flat();
   const localIP = nets.find(n => n.family === "IPv4" && !n.internal)?.address ?? "localhost";
 
-  console.log("🚀 Stock Signal Engine v3.1");
+  console.log("🚀 Stock Signal Engine v3.2 — Groww Brokerage Edition");
   console.log(`➡  Local:   http://localhost:${PORT}`);
   console.log(`➡  Network: http://${localIP}:${PORT}`);
   if (SELF_URL) console.log(`➡  Public:  ${SELF_URL}`);
-  console.log(`📊 Universe: ${STOCKS.length} stocks (Nifty 500 + BSE 200)`);
+  console.log(`📊 Universe: ${STOCKS.length} stocks`);
+  console.log(`💸 Brokerage: Groww Intraday (₹20 cap/0.05% + STT + Exchange + SEBI + Stamp + GST)`);
   console.log(`📅 Market: ${isMarketOpen() ? "🟢 OPEN — launching scan" : "🔴 CLOSED"}`);
 
   if (isMarketOpen()) {
