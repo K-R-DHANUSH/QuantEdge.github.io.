@@ -1,16 +1,13 @@
 /**
- * server.js — Elite Indian Stock Market Signal Engine v3.0
+ * server.js — Elite Indian Stock Market Signal Engine v3.1
  *
- * Changes from v2.1:
- *  - STOCKS expanded from 20 → 500+ (full Nifty 500 + top BSE stocks)
- *  - Parallel batched fetching (BATCH_SIZE=20, BATCH_DELAY=300ms) prevents rate-limit
- *  - Progressive cache: serves partial results while scan continues
- *  - /scan-status endpoint: shows live scan progress to the app
- *  - Increased CACHE_TTL to 2 min (heavy scan, no need to thrash)
- *  - SIGNAL_THRESHOLD lowered for large universe (only top BUYs returned by default)
- *  - /signals?limit=N — return top N results (default 100, max 500)
- *  - /signals?exchange=NSE|BSE|ALL — filter by exchange
- *  - All v2.1 logic preserved (12 indicators, scoring, confluence, positions)
+ * Changes from v3.0:
+ *  - BUY threshold lowered: 68 → 58 (more BUY signals in mixed markets)
+ *  - Confluence HOLD demotion raised: score < 80 → score < 65 (less aggressive demotion)
+ *  - Confluence requirement lowered: 5 → 4 indicators (easier to qualify)
+ *  - Added "WEAK BUY" signal tier (score 50–57, confluence) shown separately
+ *  - bestStock now also considers WEAK BUY if no strong BUY found
+ *  - All v3.0 logic preserved (12 indicators, scoring, positions, batching)
  */
 
 const express = require("express");
@@ -30,12 +27,11 @@ app.use(cors());
 app.use(express.json());
 
 // ── Configuration ─────────────────────────────────────────────────────────────
-const BATCH_SIZE  = 20;    // fetch N stocks in parallel
-const BATCH_DELAY = 350;   // ms between batches (avoids Yahoo rate-limit)
-const CACHE_TTL   = 120_000; // 2 minutes (scan takes ~30s for 500 stocks)
+const BATCH_SIZE  = 20;
+const BATCH_DELAY = 350;
+const CACHE_TTL   = 120_000;
 
-// ── Full NSE Stock Universe (Nifty 500 + Nifty MidSmallCap) ──────────────────
-// Covers large-cap, mid-cap, and liquid small-cap — ~95% of NSE market cap
+// ── Full NSE Stock Universe ───────────────────────────────────────────────────
 const NSE_STOCKS = [
   // ── Nifty 50 ──────────────────────────────────────────────────────────────
   "RELIANCE.NS","TCS.NS","HDFCBANK.NS","BHARTIARTL.NS","ICICIBANK.NS",
@@ -215,7 +211,7 @@ const NSE_STOCKS = [
   "TORNTPOWER.NS","UJJAIN.NS","UPL.NS","VEDL.NS","YESBANK.NS",
 ];
 
-// ── BSE Stocks (Top 200 liquid BSE-only or dual-listed with different codes) ──
+// ── BSE Stocks ────────────────────────────────────────────────────────────────
 const BSE_STOCKS = [
   "RELIANCE.BO","TCS.BO","HDFCBANK.BO","ICICIBANK.BO","INFOSYS.BO",
   "SBIN.BO","BHARTIARTL.BO","ITC.BO","HINDUNILVR.BO","BAJFINANCE.BO",
@@ -261,20 +257,18 @@ const BSE_STOCKS = [
   "COALINDIA.BO","NMDC.BO","SAIL.BO","JINDALSTEL.BO","JSPL.BO",
 ];
 
-// Deduplicate and combine
 const STOCKS = [...new Set([...NSE_STOCKS, ...BSE_STOCKS])];
-
 console.log(`📊 Total stock universe: ${STOCKS.length} symbols`);
 
 // ── Open Positions ────────────────────────────────────────────────────────────
 const openPositions = {};
 
 // ── Signal Cache ──────────────────────────────────────────────────────────────
-let signalCache     = null;
-let partialCache    = null;   // serves partial results while full scan runs
-let cacheTime       = 0;
-let isScanning      = false;
-let scanProgress    = { done: 0, total: STOCKS.length, started: null };
+let signalCache  = null;
+let partialCache = null;
+let cacheTime    = 0;
+let isScanning   = false;
+let scanProgress = { done: 0, total: STOCKS.length, started: null };
 
 // ── Market Hours (IST) ────────────────────────────────────────────────────────
 function isMarketOpen() {
@@ -290,7 +284,6 @@ function getISTTime() {
   return new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" });
 }
 
-// ── Sleep helper ──────────────────────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ── Fetch OHLCV from Yahoo Finance ────────────────────────────────────────────
@@ -326,7 +319,6 @@ async function fetchStockData(symbol) {
       timestamps: rows.map(r => r.t),
     };
   } catch (err) {
-    // Silent fail — many small-caps may not have data
     return null;
   }
 }
@@ -352,8 +344,7 @@ function projectSellTime(currentPrice, target, atr, periodMinutes = 14) {
   if (pricePerMinute === 0) return null;
   const minutesNeeded  = Math.ceil(gap / pricePerMinute);
   if (minutesNeeded > 240) return null;
-  const nowUtcMs = Date.now();
-  const sell     = new Date(nowUtcMs + minutesNeeded * 60000);
+  const sell = new Date(Date.now() + minutesNeeded * 60000);
   return sell.toLocaleTimeString("en-IN", {
     timeZone: "Asia/Kolkata",
     hour:     "2-digit",
@@ -362,6 +353,11 @@ function projectSellTime(currentPrice, target, atr, periodMinutes = 14) {
 }
 
 // ── Core Signal Engine — 12 Indicators ───────────────────────────────────────
+// v3.1 changes:
+//   • confluence threshold: >= 5  →  >= 4
+//   • BUY score threshold:  >= 68 →  >= 58
+//   • HOLD demotion guard:  < 80  →  < 65
+//   • New "WEAK BUY" signal for borderline bullish stocks
 function generateSignal(closes, highs, lows, volumes, opens) {
   const prices = closes;
   const hs = highs, ls = lows, vs = volumes;
@@ -473,7 +469,7 @@ function generateSignal(closes, highs, lows, volumes, opens) {
   // Stochastic (1.5)
   maxScore += 1.5;
   if (stoch) {
-    if (stoch.k < 20)  { bullScore += 1.5; reasons.push("Stochastic Oversold"); }
+    if (stoch.k < 20)      { bullScore += 1.5; reasons.push("Stochastic Oversold"); }
     else if (stoch.k > 80) { bearScore += 1.5; reasons.push("Stochastic Overbought"); }
   }
 
@@ -516,27 +512,40 @@ function generateSignal(closes, highs, lows, volumes, opens) {
   const trendBonus = adxVal >= 40 ? 1.3 : adxVal >= 25 ? 1.15 : adxVal >= 15 ? 1.0 : 0.85;
   const rawScore   = maxScore > 0 ? (bullScore / maxScore) * 100 : 50;
   const score      = Math.min(100, Math.round(rawScore * trendBonus));
-  const confluence = Math.max(bullScore, bearScore) >= 5;
 
+  // ── v3.1: Confluence threshold lowered 5 → 4 ─────────────────────────────
+  const confluence = Math.max(bullScore, bearScore) >= 4;
+
+  // ── v3.1: BUY threshold lowered 68 → 58 ──────────────────────────────────
   let signal = "HOLD";
-  if (score >= 68)      signal = "BUY";
+  if (score >= 58)      signal = "BUY";
   else if (score <= 32) signal = "SELL";
-  if (signal === "BUY"  && !confluence && score < 80) signal = "HOLD";
+
+  // ── v3.1: Demotion guard raised 80 → 65 (less aggressive HOLD demotion) ──
+  if (signal === "BUY"  && !confluence && score < 65) signal = "HOLD";
   if (signal === "SELL" && !confluence && score > 20) signal = "HOLD";
+
+  // ── v3.1: WEAK BUY tier — borderline bullish, worth watching ─────────────
+  // Stocks scoring 50–57 with any bullish lean become "WEAK BUY"
+  if (signal === "HOLD" && score >= 50 && bullScore > bearScore) {
+    signal = "WEAK BUY";
+  }
 
   const stopLoss = atr ? +(last - 1.5 * atr).toFixed(2) : null;
   const target   = atr ? +(last + 2.5 * atr).toFixed(2) : null;
-  const projectedSellTime = signal === "BUY" ? projectSellTime(last, target, atr) : null;
+  const projectedSellTime = (signal === "BUY" || signal === "WEAK BUY")
+    ? projectSellTime(last, target, atr)
+    : null;
 
   return {
     signal, score, bullScore, bearScore,
     reasons: reasons.slice(0, 6),
     stopLoss, target,
-    rsi:           rsi  ? Math.round(rsi)   : null,
-    mfi:           mfi  ? Math.round(mfi)   : null,
-    cci:           cci  ? Math.round(cci)   : null,
-    atr:           atr  ? +atr.toFixed(2)   : null,
-    trendStrength: adx  ? Math.round(adxVal): null,
+    rsi:           rsi  ? Math.round(rsi)    : null,
+    mfi:           mfi  ? Math.round(mfi)    : null,
+    cci:           cci  ? Math.round(cci)    : null,
+    atr:           atr  ? +atr.toFixed(2)    : null,
+    trendStrength: adx  ? Math.round(adxVal) : null,
     vwapDeviation: vwapDev ? +vwapDev.toFixed(2) : null,
     vwap:          vwapNow ? +vwapNow.toFixed(2)  : null,
     projectedSellTime,
@@ -551,15 +560,17 @@ function checkExitCondition(symbol, currentPrice, analysis) {
   const pos = openPositions[symbol];
 
   if (!pos) {
-    if (analysis.signal === "BUY") {
+    // Open position on BUY or WEAK BUY
+    if (analysis.signal === "BUY" || analysis.signal === "WEAK BUY") {
       openPositions[symbol] = {
         entryPrice:        currentPrice,
         entryTime:         getISTTime(),
         target:            analysis.target,
         stopLoss:          analysis.stopLoss,
         projectedSellTime: analysis.projectedSellTime,
+        signalType:        analysis.signal,
       };
-      return { action: "BUY", isNew: true };
+      return { action: analysis.signal, isNew: true };
     }
     return { action: analysis.signal, isNew: false };
   }
@@ -580,18 +591,17 @@ function checkExitCondition(symbol, currentPrice, analysis) {
     };
   }
 
-  return { action: "BUY", isNew: false, position: pos };
+  return { action: pos.signalType || "BUY", isNew: false, position: pos };
 }
 
 // ── Core Scanner — Batched Parallel ──────────────────────────────────────────
 async function runFullScan() {
-  if (isScanning) return; // prevent overlapping scans
+  if (isScanning) return;
   isScanning   = true;
   scanProgress = { done: 0, total: STOCKS.length, started: getISTTime() };
 
   const results = [];
   const batches = [];
-
   for (let i = 0; i < STOCKS.length; i += BATCH_SIZE) {
     batches.push(STOCKS.slice(i, i + BATCH_SIZE));
   }
@@ -601,7 +611,6 @@ async function runFullScan() {
   for (let bi = 0; bi < batches.length; bi++) {
     const batch = batches[bi];
 
-    // Process batch in parallel
     const batchResults = await Promise.all(
       batch.map(async (symbol) => {
         try {
@@ -651,8 +660,6 @@ async function runFullScan() {
     const valid = batchResults.filter(Boolean);
     results.push(...valid);
     scanProgress.done += batch.length;
-
-    // Update partial cache so /signals can serve early results
     partialCache = buildPayload(results, false);
 
     if (bi < batches.length - 1) {
@@ -660,37 +667,56 @@ async function runFullScan() {
     }
   }
 
-  // Final sort + cache
   const final = buildPayload(results, true);
-  signalCache = final;
-  cacheTime   = Date.now();
-  isScanning  = false;
+  signalCache  = final;
+  cacheTime    = Date.now();
+  isScanning   = false;
   partialCache = null;
   console.log(`✅ Scan complete: ${results.length} valid stocks | ${getISTTime()}`);
 }
 
 function buildPayload(results, isFinal) {
   const sorted = [...results].sort((a, b) => {
-    if (a.signal === "BUY" && b.signal !== "BUY") return -1;
-    if (b.signal === "BUY" && a.signal !== "BUY") return 1;
+    // Priority order: BUY > WEAK BUY > HOLD > SELL
+    const rank = s => s === "BUY" ? 4 : s === "WEAK BUY" ? 3 : s === "HOLD" ? 2 : 1;
+    const rankDiff = rank(b.signal) - rank(a.signal);
+    if (rankDiff !== 0) return rankDiff;
     if (a.confluence && !b.confluence) return -1;
     if (b.confluence && !a.confluence) return 1;
     return b.score - a.score;
   });
 
-  const best = sorted.find(s => s.signal === "BUY" && s.confluence)
-            || sorted.find(s => s.signal === "BUY")
-            || sorted[0]
-            || null;
+  // Best stock: prefer strong BUY with confluence, fallback to WEAK BUY
+  const best =
+    sorted.find(s => s.signal === "BUY" && s.confluence) ||
+    sorted.find(s => s.signal === "BUY") ||
+    sorted.find(s => s.signal === "WEAK BUY" && s.confluence) ||
+    sorted.find(s => s.signal === "WEAK BUY") ||
+    sorted[0] ||
+    null;
+
+  const buyCount      = sorted.filter(s => s.signal === "BUY").length;
+  const weakBuyCount  = sorted.filter(s => s.signal === "WEAK BUY").length;
+  const sellCount     = sorted.filter(s => s.signal === "SELL").length;
+  const holdCount     = sorted.filter(s => s.signal === "HOLD").length;
+  const confluenceCount = sorted.filter(s => s.confluence).length;
 
   return {
-    marketOpen:    true,
-    signals:       sorted,
-    bestStock:     best ? best.symbol : null,
-    timestamp:     getISTTime(),
-    openPositions: Object.keys(openPositions).length,
-    scanComplete:  isFinal,
-    totalScanned:  results.length,
+    marketOpen:     true,
+    signals:        sorted,
+    bestStock:      best ? best.symbol : null,
+    bestSignal:     best ? best.signal : null,
+    timestamp:      getISTTime(),
+    openPositions:  Object.keys(openPositions).length,
+    scanComplete:   isFinal,
+    totalScanned:   results.length,
+    summary: {
+      buy:        buyCount,
+      weakBuy:    weakBuyCount,
+      sell:       sellCount,
+      hold:       holdCount,
+      confluence: confluenceCount,
+    },
   };
 }
 
@@ -711,7 +737,7 @@ app.get("/status", (req, res) => {
   });
 });
 
-// ── /scan-status — lightweight progress endpoint ──────────────────────────────
+// ── /scan-status ──────────────────────────────────────────────────────────────
 app.get("/scan-status", (req, res) => {
   res.json({
     isScanning,
@@ -736,55 +762,69 @@ app.get("/signals", async (req, res) => {
   const limit    = Math.min(500, parseInt(req.query.limit || "200"));
   const exchange = (req.query.exchange || "ALL").toUpperCase();
 
-  // Serve full cache if fresh
+  // Filter by signal type: ?type=BUY | WEAKBUY | SELL | HOLD | ALL
+  const typeFilter = (req.query.type || "ALL").toUpperCase();
+
   if (signalCache && Date.now() - cacheTime < CACHE_TTL && req.query.force !== "true") {
-    const payload = filterPayload(signalCache, limit, exchange);
+    const payload = filterPayload(signalCache, limit, exchange, typeFilter);
     return res.json(payload);
   }
 
-  // Serve partial cache if scan is running (progressive UX)
   if (isScanning && partialCache) {
-    const payload = filterPayload(partialCache, limit, exchange);
+    const payload = filterPayload(partialCache, limit, exchange, typeFilter);
     return res.json({ ...payload, scanComplete: false });
   }
 
-  // Kick off a fresh scan (non-blocking)
   runFullScan().catch(console.error);
 
-  // If we have a stale cache, serve it while the new scan runs
   if (signalCache) {
-    const payload = filterPayload(signalCache, limit, exchange);
+    const payload = filterPayload(signalCache, limit, exchange, typeFilter);
     return res.json({ ...payload, scanComplete: false, stale: true });
   }
 
-  // First ever request — wait briefly for first batch to come in
   await sleep(3000);
   if (partialCache) {
-    const payload = filterPayload(partialCache, limit, exchange);
+    const payload = filterPayload(partialCache, limit, exchange, typeFilter);
     return res.json({ ...payload, scanComplete: false });
   }
 
   res.json({
-    marketOpen: true,
-    signals:    [],
-    bestStock:  null,
+    marketOpen:   true,
+    signals:      [],
+    bestStock:    null,
     scanComplete: false,
-    message: "Scan starting, please refresh in 30 seconds",
+    message:      "Scan starting, please refresh in 30 seconds",
   });
 });
 
-function filterPayload(payload, limit, exchange) {
+function filterPayload(payload, limit, exchange, typeFilter = "ALL") {
   let signals = payload.signals;
+
   if (exchange !== "ALL") {
     signals = signals.filter(s => s.exchange === exchange);
   }
+
+  if (typeFilter !== "ALL") {
+    if (typeFilter === "BUY") {
+      // BUY only (not WEAK BUY)
+      signals = signals.filter(s => s.signal === "BUY");
+    } else if (typeFilter === "WEAKBUY" || typeFilter === "WEAK BUY") {
+      signals = signals.filter(s => s.signal === "WEAK BUY");
+    } else if (typeFilter === "BUYS") {
+      // Both BUY and WEAK BUY
+      signals = signals.filter(s => s.signal === "BUY" || s.signal === "WEAK BUY");
+    } else {
+      signals = signals.filter(s => s.signal === typeFilter);
+    }
+  }
+
   return {
     ...payload,
     signals: signals.slice(0, limit),
   };
 }
 
-// ── Cron: Market Open/Close ───────────────────────────────────────────────────
+// ── Cron Jobs ─────────────────────────────────────────────────────────────────
 cron.schedule("15 9 * * 1-5", () => {
   console.log("🟢 Market OPEN — Launching first scan");
   signalCache = null;
@@ -797,7 +837,6 @@ cron.schedule("30 15 * * 1-5", () => {
   signalCache = null;
 }, { timezone: "Asia/Kolkata" });
 
-// Re-scan every 2 minutes during market hours (matches CACHE_TTL)
 cron.schedule("*/2 * * * 1-5", () => {
   if (isMarketOpen() && !isScanning) {
     console.log(`🔄 Scheduled rescan (${getISTTime()})`);
@@ -827,14 +866,13 @@ app.listen(PORT, "0.0.0.0", () => {
   const nets    = Object.values(os.networkInterfaces()).flat();
   const localIP = nets.find(n => n.family === "IPv4" && !n.internal)?.address ?? "localhost";
 
-  console.log("🚀 Stock Signal Engine v3.0");
+  console.log("🚀 Stock Signal Engine v3.1");
   console.log(`➡  Local:   http://localhost:${PORT}`);
   console.log(`➡  Network: http://${localIP}:${PORT}`);
   if (SELF_URL) console.log(`➡  Public:  ${SELF_URL}`);
   console.log(`📊 Universe: ${STOCKS.length} stocks (Nifty 500 + BSE 200)`);
   console.log(`📅 Market: ${isMarketOpen() ? "🟢 OPEN — launching scan" : "🔴 CLOSED"}`);
 
-  // Kick off initial scan if market is open at startup
   if (isMarketOpen()) {
     runFullScan().catch(console.error);
   }
